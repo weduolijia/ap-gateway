@@ -98,10 +98,14 @@ Then run `npm run test:auth` in another terminal. Cloud tests require `AP_CLOUD_
 
 `test/conversion-regressions.test.ts` covers the streaming and conversion fixes: redacted error frames, Anthropic context-window and pause stop reasons, Gemini thinking metadata, legacy `function_call`, interleaved content ordering, Gemini call deduplication and usage-only chunks.
 
+## Design Tokens
+
+All colours, spacing, radii and type sizes live in `public/theme-tokens.css`, which loads before `public/styles.css`. It defines the light and dark palettes; `styles.css` holds structure and component rules only. Change a token once and every page follows. There are no decorative gradients: surfaces are flat, hierarchy comes from 1px borders, and shadows are reserved for overlays (drawer, dialogs, toasts).
+
 ## Files And Data
 
 - `src/`: gateway routing, configuration, authentication and protocol conversion.
-- `public/`: dashboard assets.
+- `public/`: dashboard assets; `theme-tokens.css` holds the design tokens.
 - `test/`: unit and routing tests.
 - `schema.sql` and `migrations/`: database initialization and upgrades.
 - `verification/`: portable local and cloud verification scripts.
