@@ -69,33 +69,42 @@ function analyticsToken(env: Env): string | undefined { return env.CF_ANALYTICS_
 
 const TABLE_NAME = /^[A-Za-z0-9_]+$/;
 
-async function tableStats(db: D1Database, warnings: string[]): Promise<TableStat[]> {
-  let names: string[] = [];
-  try {
-    const listed = await db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY name").all<{ name: string }>();
-    names = listed.results.map(row => row.name);
-  } catch {
-    warnings.push('Could not list tables');
-    return [];
-  }
-  const stats: TableStat[] = [];
-  for (const name of names) {
-    if (!TABLE_NAME.test(name)) continue;
-    try {
-      // config 是 JSON 文本列；没有该列的表回退为只统计行数。
-      const row = await db.prepare(`SELECT COUNT(*) AS rows, COALESCE(SUM(LENGTH(config)),0) AS payload FROM "${name}"`).first<{ rows: number; payload: number }>();
-      stats.push({ name, rows: row?.rows ?? 0, payloadBytes: row?.payload ?? 0 });
-    } catch {
-      try {
-        const row = await db.prepare(`SELECT COUNT(*) AS rows FROM "${name}"`).first<{ rows: number }>();
-        stats.push({ name, rows: row?.rows ?? 0, payloadBytes: null });
-      } catch {
-        stats.push({ name, rows: null, payloadBytes: null });
-        warnings.push(`Could not count table ${name}`);
-      }
-    }
-  }
-  return stats;
+interface TableMeta { name: string; hasConfig: boolean }
+
+async function tableMeta(db: D1Database): Promise<TableMeta[]> {
+  // pragma_table_info is not callable through D1's correlated form (SQLITE_AUTH), so the column
+  // list comes from the CREATE TABLE text in one round trip instead of one PRAGMA per table.
+  const listed = await db.prepare("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY name")
+    .all<{ name: string; sql: string | null }>();
+  return listed.results.filter(row => TABLE_NAME.test(row.name)).map(row => ({ name: row.name, hasConfig: /\bconfig\b/i.test(row.sql ?? '') }));
+}
+
+/**
+ * All per-table counts, the log window and today's totals in a single D1 batch (one HTTP round trip).
+ * The panel is opened by hand, but it must not fan out into a dozen sequential D1 calls.
+ */
+async function collectStats(db: D1Database, meta: TableMeta[], dayStart: string): Promise<{
+  tables: TableStat[]; logWindow: { oldest: string | null; newest: string | null };
+  today: { requests: number; errors: number | null; avg_ms: number | null; max_ms: number | null };
+}> {
+  const statements = meta.map(table => table.hasConfig
+    ? db.prepare(`SELECT COUNT(*) AS rows, COALESCE(SUM(LENGTH(config)),0) AS payload FROM "${table.name}"`)
+    : db.prepare(`SELECT COUNT(*) AS rows, NULL AS payload FROM "${table.name}"`));
+  statements.push(db.prepare('SELECT MIN(time) AS oldest, MAX(time) AS newest FROM request_logs'));
+  statements.push(db.prepare('SELECT COUNT(*) AS requests, SUM(CASE WHEN status>=500 THEN 1 ELSE 0 END) AS errors, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM request_logs WHERE time>=?').bind(dayStart));
+  const results = await db.batch(statements) as D1Result<Record<string, any>>[];
+  const tables: TableStat[] = meta.map((table, index) => ({
+    name: table.name,
+    rows: (results[index]?.results?.[0]?.rows as number | undefined) ?? null,
+    payloadBytes: (results[index]?.results?.[0]?.payload as number | null | undefined) ?? null,
+  }));
+  const window = results[meta.length]?.results?.[0] ?? {};
+  const today = results[meta.length + 1]?.results?.[0] ?? {};
+  return {
+    tables,
+    logWindow: { oldest: (window.oldest as string | null) ?? null, newest: (window.newest as string | null) ?? null },
+    today: { requests: Number(today.requests ?? 0), errors: today.errors === null || today.errors === undefined ? null : Number(today.errors), avg_ms: today.avg_ms === null || today.avg_ms === undefined ? null : Number(today.avg_ms), max_ms: today.max_ms === null || today.max_ms === undefined ? null : Number(today.max_ms) },
+  };
 }
 
 async function d1MetadataSize(env: Env): Promise<{ size: number | null; note: string }> {
@@ -132,90 +141,109 @@ async function graphql(env: Env, query: string): Promise<any | null> {
   } catch { return null; }
 }
 
-export async function d1Status(db: D1Database, env: Env): Promise<D1Status> {
-  const warnings: string[] = [];
+const accountGraphQuery = (accountId: string, databaseId: string | undefined, today: string) => `{ viewer { accounts(filter: {accountTag: "${accountId}"}) {
+  workersInvocationsAdaptive(limit: 20, filter: {date_geq: "${today}", date_leq: "${today}"}) { sum { requests errors } quantiles { cpuTimeP50 cpuTimeP99 } dimensions { scriptName } }
+  d1AnalyticsAdaptiveGroups(limit: 50, filter: {date_geq: "${today}", date_leq: "${today}"}) { sum { readQueries writeQueries rowsRead rowsWritten } dimensions { databaseId } }
+} } }`;
+
+async function accountUsage(env: Env, databaseId: string | undefined): Promise<{ workers: WorkersStatus['accountUsage']; d1: D1AccountUsage }> {
+  const unavailableWorkers: WorkersStatus['accountUsage'] = { available: false, requests: null, errors: null, cpuTimeP50Ms: null, cpuTimeP99Ms: null, period: null, note: '' };
+  const unavailableD1: D1AccountUsage = { available: false, rowsRead: null, rowsWritten: null, note: '' };
+  if (!analyticsToken(env)) {
+    const note = 'CF_ANALYTICS_TOKEN is not set; account-level usage is unavailable.';
+    return { workers: { ...unavailableWorkers, note }, d1: { ...unavailableD1, note } };
+  }
+  const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
+  // One GraphQL round trip covers both Workers and D1 usage.
+  const payload = await graphql(env, accountGraphQuery(env.CF_ACCOUNT_ID!, databaseId, dayStart.toISOString().slice(0, 10)));
+  const account = payload?.data?.viewer?.accounts?.[0];
+  const own = Array.isArray(account?.workersInvocationsAdaptive) ? account.workersInvocationsAdaptive.find((row: any) => row?.dimensions?.scriptName === 'ap-gateway') : undefined;
+  const workers: WorkersStatus['accountUsage'] = own
+    ? {
+      available: true,
+      requests: own.sum?.requests ?? 0,
+      errors: own.sum?.errors ?? 0,
+      cpuTimeP50Ms: typeof own.quantiles?.cpuTimeP50 === 'number' ? Math.round(own.quantiles.cpuTimeP50 / 10) / 100 : null,
+      cpuTimeP99Ms: typeof own.quantiles?.cpuTimeP99 === 'number' ? Math.round(own.quantiles.cpuTimeP99 / 10) / 100 : null,
+      period: 'today',
+      note: 'From Cloudflare GraphQL Analytics (UTC day, ap-gateway script only).',
+    }
+    : { ...unavailableWorkers, note: 'The token cannot read Workers Analytics, or there is no data for today yet.' };
+  const d1Row = Array.isArray(account?.d1AnalyticsAdaptiveGroups) ? account.d1AnalyticsAdaptiveGroups.find((row: any) => row?.dimensions?.databaseId === databaseId) : undefined;
+  const d1: D1AccountUsage = d1Row
+    ? { available: true, rowsRead: d1Row.sum?.rowsRead ?? 0, rowsWritten: d1Row.sum?.rowsWritten ?? 0, note: '来自 Cloudflare GraphQL Analytics（UTC 当日，仅本数据库）。' }
+    : { ...unavailableD1, note: 'The token cannot read D1 Analytics, or there is no data for today yet.' };
+  return { workers, d1 };
+}
+
+// Repeated panel opens within this window reuse the previous result; the data moves on a minute scale.
+const VIEW_TTL_MS = 30_000;
+const viewCache = new WeakMap<object, { value: RuntimeView; expires: number }>();
+
+export async function runtimeView(db: D1Database, env: Env, now = Date.now()): Promise<RuntimeView> {
+  const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
   let reachable = true;
   try { await db.prepare('SELECT 1 AS ok').first(); } catch { reachable = false; }
-  if (!reachable) {
-    return { name: 'database', reachable, sizeBytes: null, sizeSource: 'unavailable', storagePercent: null, tables: [], totalRows: null, requestLogRows: null, logWindow: { oldest: null, newest: null }, warnings: ['D1 connection failed'] };
+
+  const warnings: string[] = [];
+  if (!reachable) warnings.push('D1 connection failed');
+  let meta: TableMeta[] = [];
+  let collected: Awaited<ReturnType<typeof collectStats>> | null = null;
+  if (reachable) {
+    try { meta = await tableMeta(db); } catch { warnings.push('Could not list tables'); }
+    try { collected = await collectStats(db, meta, dayStart.toISOString()); }
+    catch { warnings.push('Could not read table statistics'); }
   }
-  const tables = await tableStats(db, warnings);
-  const meta = await d1MetadataSize(env);
-  if (meta.note) warnings.push(meta.note);
-  const totalRows = tables.every(table => table.rows !== null) ? tables.reduce((sum, table) => sum + (table.rows ?? 0), 0) : null;
-  let logWindow: D1Status['logWindow'] = { oldest: null, newest: null };
-  try {
-    const row = await db.prepare('SELECT MIN(time) AS oldest, MAX(time) AS newest FROM request_logs').first<{ oldest: string | null; newest: string | null }>();
-    logWindow = { oldest: row?.oldest ?? null, newest: row?.newest ?? null };
-  } catch { warnings.push('Could not read the log time range'); }
-  return {
+
+  // External calls (metadata + account analytics) run alongside each other, not after the D1 work.
+  const [size, usage] = await Promise.all([
+    reachable ? d1MetadataSize(env) : Promise.resolve({ size: null, note: '' }),
+    accountUsage(env, env.CF_D1_DATABASE_ID),
+  ]);
+  if (size.note) warnings.push(size.note);
+
+  const tables = collected?.tables ?? [];
+  const totalRows = tables.length && tables.every(table => table.rows !== null) ? tables.reduce((sum, table) => sum + (table.rows ?? 0), 0) : null;
+  const d1: D1Status = {
     name: env.CF_D1_DATABASE_ID ? 'ap-gateway-cloud-db' : 'ap-gateway-db',
     reachable,
-    sizeBytes: meta.size,
-    sizeSource: meta.size !== null ? 'metadata-api' : 'unavailable',
-    storagePercent: meta.size !== null ? Math.round(meta.size / PLAN_LIMITS.d1DatabaseBytes * 10000) / 100 : null,
+    sizeBytes: size.size,
+    sizeSource: size.size !== null ? 'metadata-api' : 'unavailable',
+    storagePercent: size.size !== null ? Math.round(size.size / PLAN_LIMITS.d1DatabaseBytes * 10000) / 100 : null,
     tables,
     totalRows,
     requestLogRows: tables.find(table => table.name === 'request_logs')?.rows ?? null,
-    logWindow,
+    logWindow: collected?.logWindow ?? { oldest: null, newest: null },
     warnings,
   };
+  const today = collected?.today;
+  const workers: WorkersStatus = {
+    requestsToday: today ? today.requests : null,
+    errorsToday: today ? today.errors : null,
+    averageDurationMs: today?.avg_ms != null ? Math.round(today.avg_ms) : null,
+    maxDurationMs: today?.max_ms ?? null,
+    source: today ? 'request-log' : 'unavailable',
+    planLimits: PLAN_LIMITS,
+    accountUsage: usage.workers,
+  };
+  const view: RuntimeView = { generatedAt: new Date(now).toISOString(), d1, workers, d1AccountUsage: usage.d1, tokenConfigured: !!(env.CF_API_TOKEN || env.CF_ANALYTICS_TOKEN) };
+  viewCache.set(db as unknown as object, { value: view, expires: now + VIEW_TTL_MS });
+  return view;
+}
+
+export function cachedRuntimeView(db: object): RuntimeView | undefined {
+  const entry = viewCache.get(db);
+  return entry && entry.expires > Date.now() ? entry.value : undefined;
+}
+
+export async function d1Status(db: D1Database, env: Env): Promise<D1Status> {
+  return (await runtimeView(db, env)).d1;
 }
 
 export async function workersStatus(db: D1Database, env: Env): Promise<WorkersStatus> {
-  const accountUsage: WorkersStatus['accountUsage'] = { available: false, requests: null, errors: null, cpuTimeP50Ms: null, cpuTimeP99Ms: null, period: null, note: '' };
-  let requestsToday: number | null = null;
-  let errorsToday: number | null = null;
-  let averageDurationMs: number | null = null;
-  let maxDurationMs: number | null = null;
-  let source: WorkersStatus['source'] = 'unavailable';
-  const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
-  try {
-    const row = await db.prepare('SELECT COUNT(*) AS requests, SUM(CASE WHEN status>=500 THEN 1 ELSE 0 END) AS errors, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM request_logs WHERE time>=?')
-      .bind(dayStart.toISOString()).first<{ requests: number; errors: number | null; avg_ms: number | null; max_ms: number | null }>();
-    requestsToday = row?.requests ?? 0;
-    errorsToday = row?.errors ?? 0;
-    averageDurationMs = row?.avg_ms !== null && row?.avg_ms !== undefined ? Math.round(row.avg_ms) : null;
-    maxDurationMs = row?.max_ms ?? null;
-    source = 'request-log';
-  } catch { /* 面板显示不可用 */ }
-
-  if (!analyticsToken(env)) {
-    accountUsage.note = 'CF_ANALYTICS_TOKEN is not set; account-level Workers usage and CPU quota are unavailable.';
-  } else {
-    // date_geq/date_leq 使用 UTC 日期；只统计本 Worker 的脚本名。
-    const today = dayStart.toISOString().slice(0, 10);
-    const payload = await graphql(env, `{ viewer { accounts(filter: {accountTag: "${env.CF_ACCOUNT_ID}"}) { workersInvocationsAdaptive(limit: 20, filter: {date_geq: "${today}", date_leq: "${today}"}) { sum { requests errors } quantiles { cpuTimeP50 cpuTimeP99 } dimensions { scriptName } } } } }`);
-    const rows = payload?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive;
-    const own = Array.isArray(rows) ? rows.find((row: any) => row?.dimensions?.scriptName === 'ap-gateway') : undefined;
-    if (own) {
-      accountUsage.available = true;
-      accountUsage.requests = own.sum?.requests ?? 0;
-      accountUsage.errors = own.sum?.errors ?? 0;
-      accountUsage.cpuTimeP50Ms = typeof own.quantiles?.cpuTimeP50 === 'number' ? Math.round(own.quantiles.cpuTimeP50 / 10) / 100 : null;
-      accountUsage.cpuTimeP99Ms = typeof own.quantiles?.cpuTimeP99 === 'number' ? Math.round(own.quantiles.cpuTimeP99 / 10) / 100 : null;
-      accountUsage.period = 'today';
-      accountUsage.note = 'From Cloudflare GraphQL Analytics (UTC day, ap-gateway script only).';
-    } else {
-      accountUsage.note = 'The token cannot read GraphQL Analytics, or there is no data for today yet.';
-    }
-  }
-
-  return { requestsToday, errorsToday, averageDurationMs, maxDurationMs, source, planLimits: PLAN_LIMITS, accountUsage };
+  return (await runtimeView(db, env)).workers;
 }
 
 export async function d1AccountUsage(env: Env): Promise<D1AccountUsage> {
-  if (!analyticsToken(env)) return { available: false, rowsRead: null, rowsWritten: null, note: 'CF_ANALYTICS_TOKEN is not set; account-level D1 rows read/written are unavailable.' };
-  const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
-  const today = dayStart.toISOString().slice(0, 10);
-  const payload = await graphql(env, `{ viewer { accounts(filter: {accountTag: "${env.CF_ACCOUNT_ID}"}) { d1AnalyticsAdaptiveGroups(limit: 50, filter: {date_geq: "${today}", date_leq: "${today}"}) { sum { readQueries writeQueries rowsRead rowsWritten } dimensions { databaseId } } } } }`);
-  const rows = payload?.data?.viewer?.accounts?.[0]?.d1AnalyticsAdaptiveGroups;
-  const own = Array.isArray(rows) ? rows.find((row: any) => row?.dimensions?.databaseId === env.CF_D1_DATABASE_ID) : undefined;
-  if (!own) return { available: false, rowsRead: null, rowsWritten: null, note: 'The token cannot read D1 Analytics, or there is no data for today yet.' };
-  return { available: true, rowsRead: own.sum?.rowsRead ?? 0, rowsWritten: own.sum?.rowsWritten ?? 0, note: '来自 Cloudflare GraphQL Analytics（UTC 当日，仅本数据库）。' };
-}
-
-export async function runtimeView(db: D1Database, env: Env): Promise<RuntimeView> {
-  const [d1, workers, d1Usage] = await Promise.all([d1Status(db, env), workersStatus(db, env), d1AccountUsage(env)]);
-  return { generatedAt: new Date().toISOString(), d1, workers, d1AccountUsage: d1Usage, tokenConfigured: !!(env.CF_API_TOKEN || env.CF_ANALYTICS_TOKEN) };
+  return (await accountUsage(env, env.CF_D1_DATABASE_ID)).d1;
 }

@@ -130,8 +130,9 @@ Health and readiness responses set `cache-control: no-store`.
 
 The overview page shows a runtime panel backed by `GET /api/runtime` (administrator session required):
 
-- **D1 status**: connection state, per-table row counts, `config` payload size, request-log count and time range. The database file size comes from Cloudflare's metadata API when `CF_API_TOKEN` is set.
-- **Workers usage**: requests, 5xx count and durations recorded by the gateway itself for the current UTC day, plus free-plan reference limits. These are not account quota usage.
+- **Quota bars**: Workers requests today, D1 rows read/written today and database storage, each drawn as a progress bar that changes colour as usage climbs.
+- **D1 status**: connection state, per-table row counts, `config` payload size, request-log count and time range, and the database file size.
+- **Gateway usage today**: requests, 5xx count and average/max duration recorded by the gateway itself.
 - **Account-level metrics**: Workers requests/CPU and D1 rows read/written are account-scoped and require a token with Analytics read permission. Without one the panel says so instead of estimating.
 
 Account-level data uses two optional tokens with different scopes:
@@ -145,6 +146,8 @@ npx wrangler secret put CF_API_TOKEN --env cloud
 - `CF_API_TOKEN` needs D1 read access and is used to fetch the database `file_size`; when it is absent the gateway falls back to `CF_ANALYTICS_TOKEN` if that token also carries D1 read.
 
 Set `CF_ACCOUNT_ID` and `CF_D1_DATABASE_ID` in the cloud environment to your own values.
+
+`GET /api/runtime` caches its result for 30 seconds per Worker instance; the panel's refresh button sends `?refresh=1` to force a re-read.
 
 ## Dashboard Refresh
 

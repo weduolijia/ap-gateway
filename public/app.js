@@ -60,7 +60,7 @@ function clearSensitiveData() {
     if (!['checkbox', 'radio'].includes(element.type)) element.value = '';
   });
   all('input, select, textarea', byId('test-form')).forEach((element) => { element.disabled = false; });
-  for (const id of ['channels-body', 'overview-channel-body', 'logs-body', 'gateway-keys-body', 'traffic-chart', 'detail-content', 'test-channel', 'test-model', 'setting-channel', 'response-text', 'response-raw', 'runtime-d1', 'runtime-workers', 'runtime-tables', 'toast-container']) byId(id).replaceChildren();
+  for (const id of ['channels-body', 'overview-channel-body', 'logs-body', 'gateway-keys-body', 'traffic-chart', 'detail-content', 'test-channel', 'test-model', 'setting-channel', 'response-text', 'response-raw', 'runtime-d1', 'runtime-quota', 'runtime-tables', 'toast-container']) byId(id).replaceChildren();
   for (const id of ['metric-total', 'metric-success', 'metric-latency', 'metric-channels', 'channel-nav-count', 'overview-channel-count', 'channels-enabled-summary', 'channels-model-summary', 'channel-result-count', 'log-result-count', 'key-nav-count', 'gateway-key-count', 'gateway-key-summary', 'test-channel-note', 'test-upstream-note', 'settings-saved', 'password-status', 'test-ttfb', 'test-duration', 'test-http', 'key-status', 'key-input-summary', 'metric-total-foot', 'metric-channels-foot', 'chart-total']) byId(id).textContent = '—';
   for (const id of ['global-error', 'channel-form-error', 'create-key-error', 'keys-error', 'password-error', 'test-error']) setError(id, '');
   for (const id of ['event-count', 'test-events']) byId(id).textContent = '0';
@@ -447,16 +447,53 @@ function runtimeRow(label, value, tone = '') {
   return `<dt>${escapeHtml(label)}</dt><dd${tone ? ` class="${tone}"` : ''}>${value}</dd>`;
 }
 
-async function loadRuntime() {
+function percentText(percent) {
+  if (!percent) return '0';
+  if (percent < 0.1) return '&lt;0.1';
+  if (percent < 10) return percent.toFixed(1);
+  // Avoid rounding 99.9 up to a misleading 100; only a real 100 says 100.
+  if (percent < 100 && Math.round(percent) === 100) return '99.9';
+  return String(Math.round(percent));
+}
+
+function quotaBar(label, used, limit, options = {}) {
+  const { unit = '', available = true, bytes = false, warnAt = 80 } = options;
+  const format = (value) => bytes ? formatBytes(value) : numberFormat.format(value);
+  const known = available && used !== null && used !== undefined && limit > 0;
+  const percent = known ? Math.min(100, used / limit * 100) : 0;
+  const tone = !available ? 'unavailable' : !known ? 'unavailable' : percent >= warnAt ? 'high' : percent >= warnAt / 2 ? 'medium' : 'low';
+  const value = !available ? '未配置令牌' : used === null || used === undefined ? '—' : `${format(used)}${escapeHtml(unit)}`;
+  const limitText = known && !bytes ? `<small> / ${numberFormat.format(limit)}${escapeHtml(unit)}</small>` : known && bytes ? `<small> / ${formatBytes(limit)}</small>` : '';
+  // Very small usage still shows a sliver so the bar is not mistaken for a broken element.
+  const width = known ? Math.max(percent, percent > 0 ? 1.5 : 0) : 0;
+  return `<div class="quota-item${available ? '' : ' muted'}" role="group" aria-label="${escapeHtml(label)}">
+    <div class="quota-head"><span class="quota-label">${escapeHtml(label)}</span><span class="quota-value">${value}${limitText}</span></div>
+    <div class="quota-track" aria-hidden="true"><span class="quota-fill ${tone}" style="width:${width}%"></span></div>
+    <div class="quota-foot">${!available ? '未配置令牌，账号级用量不可读' : !known ? '暂无数据' : `${percentText(percent)}% 已用`}</div>
+  </div>`;
+}
+
+async function loadRuntime(force = false) {
   if (!auth.authenticated) return;
   const version = auth.version;
   const note = byId('runtime-note');
   const health = byId('runtime-health');
   try {
-    const view = await api('/api/runtime');
+    const view = await api(`/api/runtime${force ? '?refresh=1' : ''}`);
     if (version !== auth.version || !auth.authenticated) return;
     health.textContent = view.d1.reachable ? (view.d1.warnings.length ? '有提示' : '正常') : '不可用';
     health.className = `inline-count${view.d1.reachable ? (view.d1.warnings.length ? ' warn' : '') : ' bad'}`;
+    const usage = view.workers.accountUsage;
+    const d1Usage = view.d1AccountUsage;
+    const limits = view.workers.planLimits;
+    byId('runtime-quota').innerHTML = [
+      quotaBar('Workers 今日请求', usage.available ? usage.requests : null, limits.workerRequestsPerDay, { available: usage.available, unit: ' 次' }),
+      quotaBar('D1 今日读行', d1Usage.available ? d1Usage.rowsRead : null, limits.d1RowsReadPerDay, { available: d1Usage.available, unit: ' 行' }),
+      quotaBar('D1 今日写行', d1Usage.available ? d1Usage.rowsWritten : null, limits.d1RowsWrittenPerDay, { available: d1Usage.available, unit: ' 行' }),
+      quotaBar('D1 数据库存储', view.d1.sizeBytes, limits.d1DatabaseBytes, { available: view.d1.sizeBytes !== null, bytes: true }),
+      `<div class="quota-item plain"><div class="quota-head"><span class="quota-label">CPU 单请求上限</span><span class="quota-value">${limits.workerCpuMsPerRequest} ms</span></div><div class="quota-foot">${usage.available && usage.cpuTimeP99Ms !== null ? `账号今日 P99 ${usage.cpuTimeP99Ms} ms · P50 ${usage.cpuTimeP50Ms} ms` : '账号 CPU 用量不可读'}</div></div>`,
+      `<div class="quota-item plain"><div class="quota-head"><span class="quota-label">网关今日请求</span><span class="quota-value">${view.workers.requestsToday === null ? '—' : numberFormat.format(view.workers.requestsToday)} 次</span></div><div class="quota-foot">${view.workers.errorsToday ? `${numberFormat.format(view.workers.errorsToday)} 次 5xx · ` : ''}${view.workers.averageDurationMs === null ? '无耗时记录' : `平均 ${formatDuration(view.workers.averageDurationMs)} · 最大 ${formatDuration(view.workers.maxDurationMs)}`}</div></div>`,
+    ].join('');
     const d1Tone = view.d1.reachable ? '' : 'bad';
     byId('runtime-d1').innerHTML = [
       runtimeRow('数据库', escapeHtml(view.d1.name), d1Tone),
@@ -465,23 +502,7 @@ async function loadRuntime() {
       runtimeRow('总行数', view.d1.totalRows === null ? '—' : numberFormat.format(view.d1.totalRows)),
       runtimeRow('请求日志', view.d1.requestLogRows === null ? '—' : `${numberFormat.format(view.d1.requestLogRows)} 条`),
       runtimeRow('日志时间范围', view.d1.logWindow.oldest ? `${escapeHtml(formatTime(view.d1.logWindow.oldest))} 至 ${escapeHtml(formatTime(view.d1.logWindow.newest))}` : '暂无记录'),
-      runtimeRow('数据库大小', view.d1.sizeBytes === null ? '未配置令牌' : formatBytes(view.d1.sizeBytes), view.d1.sizeBytes === null ? 'warn' : ''),
-      runtimeRow('存储上限占比', view.d1.storagePercent === null ? '—' : `${view.d1.storagePercent}%`),
-    ].join('');
-    const usage = view.workers.accountUsage;
-    const d1Usage = view.d1AccountUsage;
-    byId('runtime-workers').innerHTML = [
-      runtimeRow('今日请求（网关日志）', view.workers.requestsToday === null ? '—' : numberFormat.format(view.workers.requestsToday)),
-      runtimeRow('今日 5xx', view.workers.errorsToday === null ? '—' : numberFormat.format(view.workers.errorsToday), view.workers.errorsToday ? 'warn' : ''),
-      runtimeRow('日均耗时 / 最大', view.workers.averageDurationMs === null ? '—' : `${formatDuration(view.workers.averageDurationMs)} / ${formatDuration(view.workers.maxDurationMs)}`),
-      runtimeRow('账号今日请求', usage.available ? numberFormat.format(usage.requests) : '未配置令牌', usage.available ? '' : 'warn'),
-      runtimeRow('CPU P50 / P99', usage.available ? `${usage.cpuTimeP50Ms ?? '—'} / ${usage.cpuTimeP99Ms ?? '—'} ms` : '—'),
-      runtimeRow('单请求 CPU 上限', `${view.workers.planLimits.workerCpuMsPerRequest} ms`),
-      runtimeRow('每日请求上限', numberFormat.format(view.workers.planLimits.workerRequestsPerDay)),
-      runtimeRow('D1 今日读行', d1Usage.available ? numberFormat.format(d1Usage.rowsRead) : '未配置令牌', d1Usage.available ? '' : 'warn'),
-      runtimeRow('D1 今日写行', d1Usage.available ? numberFormat.format(d1Usage.rowsWritten) : '未配置令牌', d1Usage.available ? '' : 'warn'),
-      runtimeRow('D1 读行上限/日', numberFormat.format(view.workers.planLimits.d1RowsReadPerDay)),
-      runtimeRow('D1 写行上限/日', numberFormat.format(view.workers.planLimits.d1RowsWrittenPerDay)),
+      runtimeRow('数据文件大小', view.d1.sizeBytes === null ? '未配置令牌' : formatBytes(view.d1.sizeBytes), view.d1.sizeBytes === null ? 'warn' : ''),
     ].join('');
     byId('runtime-tables').innerHTML = view.d1.tables.length
       ? view.d1.tables.map(table => `<div class="runtime-table-row"><span>${escapeHtml(table.name)}</span><span>${table.rows === null ? '—' : numberFormat.format(table.rows)} 行${table.payloadBytes ? ` · ${formatBytes(table.payloadBytes)}` : ''}</span></div>`).join('')
@@ -1420,7 +1441,7 @@ function setup() {
   byId('sidebar-backdrop').addEventListener('click', closeSidebar);
   all('[data-open-channel]').forEach((button) => button.addEventListener('click', () => openChannel()));
   byId('refresh-all').addEventListener('click', () => withButton(byId('refresh-all'), () => loadAll(true)));
-  byId('refresh-runtime').addEventListener('click', () => withButton(byId('refresh-runtime'), async () => { await loadRuntime(); toast('运行状态已刷新'); }));
+  byId('refresh-runtime').addEventListener('click', () => withButton(byId('refresh-runtime'), async () => { await loadRuntime(true); toast('运行状态已刷新'); }));
   for (const [id, loader] of [['refresh-channels', () => loadChannels()], ['refresh-logs', () => loadLogs()]]) byId(id).addEventListener('click', () => withButton(byId(id), async () => { await loader(); toast('数据已刷新'); }));
   byId('channel-search').addEventListener('input', renderChannels);
   byId('channel-filter').addEventListener('change', renderChannels);

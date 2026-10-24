@@ -780,3 +780,22 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--focus);outline-offs
 .runtime-table-row span:last-child{color:var(--text-3);white-space:nowrap;font-variant-numeric:tabular-nums}
 .runtime-note{padding:0 23px 21px}
 @media(max-width:1000px){.runtime-grid{grid-template-columns:1fr;gap:var(--sp-5)}}
+
+/* ⑭ 运行状态：配额进度条 -------------------------------------------- */
+.quota-list{display:flex;flex-direction:column;gap:var(--sp-4)}
+.quota-item{display:flex;flex-direction:column;gap:var(--sp-2)}
+.quota-item.muted{opacity:.7}
+.quota-head{display:flex;align-items:baseline;justify-content:space-between;gap:var(--sp-3);font-size:var(--fs-2xs)}
+.quota-label{color:var(--text-3)}
+.quota-value{color:var(--text-2);font-variant-numeric:tabular-nums;font-weight:550;white-space:nowrap}
+.quota-value small{color:var(--text-4);font-weight:400}
+.quota-track{height:7px;border-radius:999px;background:var(--surface);overflow:hidden;box-shadow:inset 0 0 0 1px var(--line)}
+.quota-fill{display:block;height:100%;border-radius:999px;transition:width .45s ease}
+.quota-fill.low{background:linear-gradient(90deg,var(--chart-base),var(--teal))}
+.quota-fill.medium{background:linear-gradient(90deg,var(--chart-tip),var(--amber))}
+.quota-fill.high{background:linear-gradient(90deg,var(--chart-tip),var(--red))}
+.quota-fill.unavailable{background:var(--line)}
+.quota-foot{font-size:var(--fs-2xs);color:var(--text-4)}
+.quota-item.plain .quota-head{font-size:var(--fs-2xs)}
+.quota-item.plain .quota-value{font-weight:600}
+@media(prefers-reduced-motion:reduce){.quota-fill{transition:none}}

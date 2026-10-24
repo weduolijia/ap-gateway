@@ -12,29 +12,32 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 function fakeDb(options: { fail?: boolean; tables?: Record<string, number> } = {}) {
   const tables = options.tables ?? { channels: 2, request_logs: 500, settings: 1 };
-  const prepare = vi.fn((sql: string) => ({
-    bind: (...args: unknown[]) => ({ first: async () => boundFirst(sql, args), all: async () => boundAll(sql) }),
-    first: async () => unboundFirst(sql),
-    all: async () => boundAll(sql),
-  }));
-  const boundFirst = async (sql: string, _args: unknown[]) => {
+  const names = Object.keys(tables);
+  const prepare = vi.fn((sql: string) => {
+    if (sql.includes('SELECT 1')) return { first: async () => { if (options.fail) throw new Error('d1 down'); return { ok: 1 }; } };
+    if (sql.includes('sqlite_master')) {
+      return {
+        all: async () => {
+          if (options.fail) throw new Error('d1 down');
+          return { results: names.map(name => ({ name, sql: name === 'channels' || name === 'request_logs' || name === 'settings' ? `CREATE TABLE ${name} (id TEXT PRIMARY KEY, config TEXT NOT NULL)` : `CREATE TABLE ${name} (id TEXT PRIMARY KEY)` })) };
+        },
+      };
+    }
+    // Batching means every count/window/today statement goes through db.batch, not .first().
+    return { sql, bind: (...args: unknown[]) => ({ sql, args }) };
+  });
+  const batch = vi.fn(async (statements: { sql: string; args?: unknown[] }[]) => {
     if (options.fail) throw new Error('d1 down');
-    if (sql.includes('COUNT(*) AS requests')) return { requests: 120, errors: 2, avg_ms: 41.4, max_ms: 900 };
-    return null;
-  };
-  const unboundFirst = async (sql: string) => {
-    if (options.fail) throw new Error('d1 down');
-    if (sql.includes('SELECT 1')) return { ok: 1 };
-    if (sql.includes('MIN(time)')) return { oldest: '2026-10-23T00:00:00.000Z', newest: '2026-10-24T00:00:00.000Z' };
-    if (sql.includes('COUNT(*) AS rows')) return { rows: 500, payload: 120000 };
-    return null;
-  };
-  const boundAll = async (sql: string) => {
-    if (options.fail) throw new Error('d1 down');
-    if (sql.includes('sqlite_master')) return { results: Object.keys(tables).map(name => ({ name })) };
-    return { results: [] };
-  };
-  return { prepare } as unknown as D1Database;
+    return statements.map(statement => {
+      const sql = statement.sql;
+      if (sql.includes('COUNT(*) AS requests')) return { results: [{ requests: 120, errors: 2, avg_ms: 41.4, max_ms: 900 }], success: true, meta: {} };
+      if (sql.includes('MIN(time)')) return { results: [{ oldest: '2026-10-23T00:00:00.000Z', newest: '2026-10-24T00:00:00.000Z' }], success: true, meta: {} };
+      const match = /FROM "([A-Za-z0-9_]+)"/.exec(sql);
+      const rows = match ? tables[match[1]] ?? 0 : 0;
+      return { results: [{ rows, payload: sql.includes('AS payload') && sql.includes('SUM(LENGTH') ? 120000 : null }], success: true, meta: {} };
+    });
+  });
+  return { prepare, batch } as unknown as D1Database;
 }
 
 describe('runtime status without an API token', () => {
@@ -97,22 +100,30 @@ describe('runtime status with a metadata token', () => {
     expect(status.warnings.join(' ')).toContain('HTTP 403');
   });
   it('reports Workers and D1 account usage from GraphQL analytics', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
-      const body = JSON.parse(String(init.body));
-      if (body.query.includes('workersInvocationsAdaptive')) {
-        return Response.json({ data: { viewer: { accounts: [{ workersInvocationsAdaptive: [
-          { dimensions: { scriptName: 'ap-gateway' }, sum: { requests: 1234, errors: 3 }, quantiles: { cpuTimeP50: 4345, cpuTimeP99: 120701 } },
-          { dimensions: { scriptName: 'other' }, sum: { requests: 9999, errors: 0 }, quantiles: { cpuTimeP50: 1, cpuTimeP99: 1 } },
-        ] }] } } });
+    const queries: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      if (String(url).includes('graphql')) {
+        queries.push(JSON.parse(String(init.body)).query);
+        // A single query now carries both workers and D1 analytics.
+        return Response.json({ data: { viewer: { accounts: [{
+          workersInvocationsAdaptive: [
+            { dimensions: { scriptName: 'ap-gateway' }, sum: { requests: 1234, errors: 3 }, quantiles: { cpuTimeP50: 4345, cpuTimeP99: 120701 } },
+            { dimensions: { scriptName: 'other' }, sum: { requests: 9999, errors: 0 }, quantiles: { cpuTimeP50: 1, cpuTimeP99: 1 } },
+          ],
+          d1AnalyticsAdaptiveGroups: [
+            { dimensions: { databaseId: 'other-db' }, sum: { rowsRead: 1, rowsWritten: 1 } },
+            { dimensions: { databaseId: 'db-id' }, sum: { rowsRead: 5000, rowsWritten: 120 } },
+          ],
+        }] } } });
       }
-      return Response.json({ data: { viewer: { accounts: [{ d1AnalyticsAdaptiveGroups: [
-        { dimensions: { databaseId: 'other-db' }, sum: { rowsRead: 1, rowsWritten: 1 } },
-        { dimensions: { databaseId: 'db-id' }, sum: { rowsRead: 5000, rowsWritten: 120 } },
-      ] }] } } });
+      return Response.json({ result: { file_size: 1024 } });
     }));
     const view = await runtimeView(fakeDb(), tokenEnv);
     expect(view.workers.accountUsage).toMatchObject({ available: true, requests: 1234, errors: 3, cpuTimeP50Ms: 4.35, cpuTimeP99Ms: 120.7 });
     expect(view.d1AccountUsage).toMatchObject({ available: true, rowsRead: 5000, rowsWritten: 120 });
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).toContain('workersInvocationsAdaptive');
+    expect(queries[0]).toContain('d1AnalyticsAdaptiveGroups');
   });
   it('accepts a separate analytics token and prefers it over the metadata token', async () => {
     const auth: string[] = [];
@@ -136,6 +147,22 @@ describe('runtime status with a metadata token', () => {
 });
 
 describe('runtime route', () => {
+  it('serves a cached view and bypasses it with ?refresh=1', async () => {
+    vi.spyOn(AuthService.prototype, 'checkSession').mockResolvedValue({ expiresAt: new Date(Date.now() + 10000).toISOString(), version: 1 });
+    vi.stubGlobal('fetch', vi.fn());
+    const db = fakeDb();
+    const call = (query = '') => app.fetch(new Request(`${base}/api/runtime${query}`, { headers: { cookie: `__Host-ap_session=${token}` } }), { ...env, DB: db } as Bindings);
+    const first = await call();
+    expect(first.status).toBe(200);
+    const cached = await call();
+    expect((await cached.json()).generatedAt).toBe((await first.clone().json()).generatedAt);
+    const refreshed = await call('?refresh=1');
+    expect(refreshed.status).toBe(200);
+    const prepared = (db as unknown as { prepare: ReturnType<typeof vi.fn> }).prepare;
+    const before = prepared.mock.calls.length;
+    await call();
+    expect(prepared.mock.calls.length).toBe(before);
+  });
   it('requires an administrator session', async () => {
     const response = await app.fetch(new Request(`${base}/api/runtime`), env);
     expect(response.status).toBe(401);
