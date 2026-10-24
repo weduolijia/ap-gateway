@@ -3,7 +3,7 @@ import { encodeResponse, responseCanonical, responseUsage, responseFinish, valid
 import type { Protocol } from './types';
 
 type Obj = Record<string, any>;
-type OutputBlock = { kind: 'text' | 'refusal' | 'call'; index: number; callIndex?: number };
+type OutputBlock = { kind: 'text' | 'refusal' | 'call'; index: number; callIndex?: number; itemId?: string; text?: string; emitted?: boolean };
 const encoder = new TextEncoder();
 const maximumResponseSize = 16 * 1024 * 1024;
 
@@ -36,7 +36,8 @@ class StreamWriter {
   started = false;
   private sequence = 0;
   private blocks: OutputBlock[] = [];
-  private responseContent: ('text' | 'refusal')[] = [];
+  private currentText: OutputBlock | undefined;
+  private geminiCallStarted = false;
   constructor(readonly protocol: Protocol, readonly model: string, readonly state: ChatResponse, readonly queue: Uint8Array[]) {}
   event(data: Obj, event?: string) {
     if (this.protocol === 'responses') data = { ...data, sequence_number: this.sequence++ };
@@ -62,10 +63,12 @@ class StreamWriter {
       this.event({ type: 'message_start', message: { id: this.state.id, type: 'message', role: 'assistant', model: this.model, content: [], stop_reason: null, stop_sequence: null, usage } }, 'message_start');
     }
   }
-  private block(kind: OutputBlock['kind'], callIndex?: number): OutputBlock {
-    const existing = this.blocks.find(block => block.kind === kind && block.callIndex === callIndex);
-    if (existing) return existing;
-    const block = { kind, index: this.blocks.length, ...(callIndex != null ? { callIndex } : {}) };
+  private block(kind: OutputBlock['kind'], callIndex?: number, fresh = false): OutputBlock {
+    if (!fresh) {
+      const existing = this.blocks.find(block => block.kind === kind && block.callIndex === callIndex);
+      if (existing) return existing;
+    }
+    const block: OutputBlock = { kind, index: this.blocks.length, ...(callIndex != null ? { callIndex } : {}), ...(kind !== 'call' ? { text: '' } : {}) };
     this.blocks.push(block);
     if (this.protocol === 'anthropic') {
       const call = callIndex == null ? undefined : this.state.calls[callIndex];
@@ -73,33 +76,39 @@ class StreamWriter {
       this.event({ type: 'content_block_start', index: block.index, content_block: content }, 'content_block_start');
     } else if (this.protocol === 'responses') {
       const call = callIndex == null ? undefined : this.state.calls[callIndex];
-      const item = call ? { type: 'function_call', id: `fc_${call.id}`, call_id: call.id, name: call.name, arguments: '', status: 'in_progress' } : { type: 'message', id: `msg_${this.state.id}`, role: 'assistant', content: [], status: 'in_progress' };
+      block.itemId = call ? `fc_${call.id}` : `msg_${this.state.id}_${block.index}`;
+      const item = call
+        ? { type: 'function_call', id: block.itemId, call_id: call.id, name: call.name, arguments: '', status: 'in_progress' }
+        : { id: block.itemId, type: 'message', role: 'assistant', content: [], status: 'in_progress' };
       this.responseEvent('response.output_item.added', { output_index: block.index, item });
+      if (!call) {
+        const part = kind === 'refusal' ? { type: 'refusal', refusal: '' } : { type: 'output_text', text: '', annotations: [] };
+        this.responseEvent('response.content_part.added', { item_id: block.itemId, output_index: block.index, content_index: 0, part });
+      }
     }
     return block;
   }
+  breakTextBlock() { this.currentText = undefined; }
   delta(value: string, kind: 'text' | 'refusal') {
     if (!value) return;
     this.start();
+    const block = this.currentText && this.currentText.kind === kind ? this.currentText : this.block(kind, undefined, true);
+    this.currentText = block;
+    block.text = (block.text ?? '') + value;
     if (this.protocol === 'openai') this.chat({ [kind === 'text' ? 'content' : 'refusal']: value });
-    else if (this.protocol === 'gemini') this.event({ responseId: this.state.id, modelVersion: this.model, candidates: [{ index: 0, content: { role: 'model', parts: [{ text: value }] } }] });
+    else if (this.protocol === 'gemini') {
+      // Text after a tool call is buffered and emitted with the final chunk so block order survives.
+      if (!this.geminiCallStarted) { block.emitted = true; this.event({ responseId: this.state.id, modelVersion: this.model, candidates: [{ index: 0, content: { role: 'model', parts: [{ text: value }] } }] }); }
+    }
     else if (this.protocol === 'anthropic') {
-      const block = this.block(kind);
       this.event({ type: 'content_block_delta', index: block.index, delta: { type: 'text_delta', text: value } }, 'content_block_delta');
     } else {
-      const block = this.block('text');
-      let contentIndex = this.responseContent.indexOf(kind);
-      if (contentIndex < 0) {
-        contentIndex = this.responseContent.length;
-        this.responseContent.push(kind);
-        const part = kind === 'text' ? { type: 'output_text', text: '', annotations: [] } : { type: 'refusal', refusal: '' };
-        this.responseEvent('response.content_part.added', { item_id: `msg_${this.state.id}`, output_index: block.index, content_index: contentIndex, part });
-      }
-      this.responseEvent(kind === 'text' ? 'response.output_text.delta' : 'response.refusal.delta', { item_id: `msg_${this.state.id}`, output_index: block.index, content_index: contentIndex, delta: value });
+      this.responseEvent(kind === 'text' ? 'response.output_text.delta' : 'response.refusal.delta', { item_id: block.itemId, output_index: block.index, content_index: 0, delta: value });
     }
   }
   call(callIndex: number, value: string, first: boolean) {
     this.start();
+    this.currentText = undefined;
     const call = this.state.calls[callIndex];
     if (this.protocol === 'openai') this.chat({ tool_calls: [{ index: callIndex, ...(first ? { id: call.id, type: 'function' } : {}), function: { ...(first ? { name: call.name } : {}), arguments: value } }] });
     else if (this.protocol === 'anthropic') {
@@ -107,7 +116,10 @@ class StreamWriter {
       if (value) this.event({ type: 'content_block_delta', index: block.index, delta: { type: 'input_json_delta', partial_json: value } }, 'content_block_delta');
     } else if (this.protocol === 'responses') {
       const block = this.block('call', callIndex);
-      if (value) this.responseEvent('response.function_call_arguments.delta', { item_id: `fc_${call.id}`, output_index: block.index, delta: value });
+      if (value) this.responseEvent('response.function_call_arguments.delta', { item_id: block.itemId, output_index: block.index, delta: value });
+    } else {
+      this.block('call', callIndex);
+      this.geminiCallStarted = true;
     }
   }
   finish() {
@@ -122,26 +134,40 @@ class StreamWriter {
       this.event({ type: 'message_delta', delta: { stop_reason: completed.stop_reason, stop_sequence: null }, usage: completed.usage ?? { output_tokens: 0 } }, 'message_delta');
       this.event({ type: 'message_stop' }, 'message_stop');
     } else if (this.protocol === 'gemini') {
-      completed.candidates[0].content.parts = completed.candidates[0].content.parts.filter((part: Obj) => part.functionCall);
+      const calls = new Map(completed.candidates[0].content.parts.filter((part: Obj) => part.functionCall).map((part: Obj) => [part.functionCall.id, part]));
+      const parts: Obj[] = [];
+      for (const block of this.blocks) {
+        if (block.kind === 'call') {
+          const part = calls.get(this.state.calls[block.callIndex!].id);
+          if (part) parts.push(part);
+        } else if (!block.emitted && block.text) parts.push({ text: block.text });
+      }
+      completed.candidates[0].content.parts = parts;
       this.event(completed);
     } else {
       if (!this.blocks.length) this.block('text');
+      const status = completed.status ?? 'completed';
       const output = this.blocks.map(block => {
-        if (block.kind === 'call') return completed.output.find((item: Obj) => item.call_id === this.state.calls[block.callIndex!].id);
-        const message = completed.output.find((item: Obj) => item.type === 'message') ?? { id: `msg_${this.state.id}`, type: 'message', role: 'assistant', status: completed.status, content: [] };
-        message.content = this.responseContent.map(kind => kind === 'text' ? { type: 'output_text', text: this.state.content.map(part => part.type === 'text' ? part.text : '').join(''), annotations: [] } : { type: 'refusal', refusal: this.state.refusal ?? '' });
-        return message;
+        if (block.kind === 'call') {
+          const call = this.state.calls[block.callIndex!];
+          return completed.output.find((item: Obj) => item.call_id === call.id) ?? { id: block.itemId, type: 'function_call', call_id: call.id, name: call.name, arguments: call.arguments, status };
+        }
+        const part = block.kind === 'refusal' ? { type: 'refusal', refusal: block.text ?? '' } : { type: 'output_text', text: block.text ?? '', annotations: [] };
+        return { id: block.itemId, type: 'message', role: 'assistant', status, content: block.text ? [part] : [] };
       });
       for (const block of this.blocks) {
         const item = output[block.index];
         if (block.kind === 'call') this.responseEvent('response.function_call_arguments.done', { item_id: item.id, output_index: block.index, name: item.name, arguments: item.arguments });
-        else for (const [contentIndex, part] of item.content.entries()) {
-          this.responseEvent(part.type === 'refusal' ? 'response.refusal.done' : 'response.output_text.done', { item_id: item.id, output_index: block.index, content_index: contentIndex, [part.type === 'refusal' ? 'refusal' : 'text']: part.type === 'refusal' ? part.refusal : part.text });
-          this.responseEvent('response.content_part.done', { item_id: item.id, output_index: block.index, content_index: contentIndex, part });
+        else if (item.content.length) {
+          const part = item.content[0];
+          if (part.type === 'refusal') this.responseEvent('response.refusal.done', { item_id: item.id, output_index: block.index, content_index: 0, refusal: part.refusal });
+          else this.responseEvent('response.output_text.done', { item_id: item.id, output_index: block.index, content_index: 0, text: part.text });
+          this.responseEvent('response.content_part.done', { item_id: item.id, output_index: block.index, content_index: 0, part });
         }
         this.responseEvent('response.output_item.done', { output_index: block.index, item });
       }
-      this.responseEvent(completed.status === 'incomplete' ? 'response.incomplete' : 'response.completed', { response: { ...completed, output } });
+      const text = this.blocks.filter(block => block.kind === 'text').map(block => block.text ?? '').join('');
+      this.responseEvent(status === 'incomplete' ? 'response.incomplete' : 'response.completed', { response: { ...completed, output, output_text: text } });
     }
   }
 }
@@ -151,6 +177,8 @@ class StreamReader {
   readonly state: ChatResponse = { id: `ap_${crypto.randomUUID()}`, created: Math.floor(Date.now() / 1000), content: [], calls: [], finish: '' };
   readonly writer: StreamWriter;
   private calls = new Map<number, number>();
+  private legacyCallId: string | undefined;
+  private geminiCallIds = new Map<string, number>();
   private sourceBlocks = new Map<number, 'text' | 'call'>();
   private sourceText = new Map<string, string>();
   private closedBlocks = new Set<number>();
@@ -249,6 +277,10 @@ class StreamReader {
   }
   private chat(body: Obj) {
     this.metadata(body);
+    if (body.choices == null) {
+      if (!body.usage) invalid('Upstream chunk has neither choices nor usage');
+      return;
+    }
     const choices = list(body.choices, 'choices');
     if (choices.length > 1) invalid('Cross-protocol streaming supports one choice');
     if (!choices.length) return;
@@ -256,17 +288,30 @@ class StreamReader {
     if (choice.index != null && choice.index !== 0) invalid('Cross-protocol streaming supports choice index 0');
     if (choice.logprobs != null) invalid('Cross-protocol token log probabilities are not supported');
     const delta = record(choice.delta ?? {}, 'choice.delta');
-    supported(delta, ['role', 'content', 'refusal', 'tool_calls'], 'chat delta');
+    supported(delta, ['role', 'content', 'refusal', 'tool_calls', 'function_call'], 'chat delta');
     if (delta.role != null && delta.role !== 'assistant') invalid('Upstream output role must be assistant');
     this.writer.start();
     if (delta.content != null) this.delta(delta.content);
     if (delta.refusal != null) this.delta(delta.refusal, 'refusal');
-    if (delta.tool_calls) for (const tool of list(delta.tool_calls, 'tool_calls')) {
-      supported(record(tool, 'tool call'), ['index', 'id', 'type', 'function'], 'tool call');
-      if (tool.type != null && tool.type !== 'function') invalid('Only function tools can be converted');
-      const callable = record(tool.function ?? {}, 'tool function');
-      supported(callable, ['name', 'arguments'], 'tool function');
-      this.call(index(tool.index, 'tool index'), tool.id, callable.name, callable.arguments ?? '');
+    if (delta.function_call != null) {
+      if (this.state.calls.length && !this.calls.has(-1)) invalid('A stream cannot mix tool_calls and legacy function_call');
+      const f = record(delta.function_call, 'function_call'); supported(f, ['name', 'arguments'], 'function_call');
+      const first = !this.calls.has(-1);
+      if (first) {
+        if (typeof f.name !== 'string' || !f.name) invalid('Legacy function_call requires a name before arguments');
+        this.legacyCallId = `call_${crypto.randomUUID()}`;
+      }
+      this.call(-1, first ? this.legacyCallId : undefined, f.name, f.arguments ?? '');
+    }
+    if (delta.tool_calls) {
+      if (this.calls.has(-1)) invalid('A stream cannot mix tool_calls and legacy function_call');
+      for (const tool of list(delta.tool_calls, 'tool_calls')) {
+        supported(record(tool, 'tool call'), ['index', 'id', 'type', 'function'], 'tool call');
+        if (tool.type != null && tool.type !== 'function') invalid('Only function tools can be converted');
+        const callable = record(tool.function ?? {}, 'tool function');
+        supported(callable, ['name', 'arguments'], 'tool function');
+        this.call(index(tool.index, 'tool index'), tool.id, callable.name, callable.arguments ?? '');
+      }
     }
     if (choice.finish_reason != null) this.state.finish = responseFinish(choice.finish_reason, 'openai', !!this.state.calls.length);
   }
@@ -280,7 +325,8 @@ class StreamReader {
       const outputIndex = index(body.output_index, 'output_index');
       if (item.type === 'reasoning') { validateResponseReasoning(item); this.writer.reasoningActivity(); }
       else if (item.type === 'function_call') this.call(outputIndex, item.call_id, item.name, item.arguments ?? '');
-      else if (item.type !== 'message') invalid(`Unsupported Responses streaming item ${item.type}; use same-protocol routing`);
+      else if (item.type === 'message') this.writer.breakTextBlock();
+      else invalid(`Unsupported Responses streaming item ${item.type}; use same-protocol routing`);
     } else if (type === 'response.reasoning_summary_part.added' || type === 'response.reasoning_summary_part.done') {
       index(body.output_index, 'output_index');
       index(body.summary_index, 'summary_index');
@@ -349,6 +395,7 @@ class StreamReader {
       if (block.type === 'text') {
         supported(block, ['type', 'text', 'citations'], 'Anthropic text');
         if (block.citations?.length) invalid('Cross-protocol citations are not supported');
+        this.writer.breakTextBlock();
         this.sourceBlocks.set(blockIndex, 'text');
         if (block.text) this.delta(block.text);
       } else if (block.type === 'tool_use') {
@@ -391,13 +438,26 @@ class StreamReader {
     if (candidate.citationMetadata?.citations?.length || candidate.groundingMetadata) invalid('Gemini cited/grounded output requires same-protocol routing');
     if (this.state.finish && candidate.content?.parts?.length) invalid('Gemini sent content after its finishReason');
     for (const part of list(candidate.content?.parts ?? [], 'candidate parts')) {
-      supported(record(part, 'Gemini part'), ['text', 'functionCall'], 'Gemini part');
+      supported(record(part, 'Gemini part'), ['text', 'functionCall', 'thought', 'thoughtSignature', 'partMetadata', 'mediaResolution', 'mediaProcessing'], 'Gemini part');
+      if (part.thought === true) continue;
       if (part.text != null) this.delta(part.text);
       else if (part.functionCall) {
         const call = record(part.functionCall, 'functionCall');
-        supported(call, ['id', 'name', 'args'], 'Gemini functionCall');
-        this.call(this.calls.size, call.id ?? `call_${this.calls.size}`, call.name, JSON.stringify(record(call.args ?? {}, 'function args')));
-      } else invalid('Unsupported Gemini streaming part');
+        supported(call, ['id', 'name', 'args', 'thoughtSignature'], 'Gemini functionCall');
+        const id = typeof call.id === 'string' && call.id ? call.id : `call_${this.calls.size}`;
+        const argumentsText = JSON.stringify(record(call.args ?? {}, 'function args'));
+        const sourceIndex = this.geminiCallIds.get(id);
+        if (sourceIndex == null) {
+          this.geminiCallIds.set(id, this.calls.size);
+          this.call(this.calls.size, id, call.name, argumentsText);
+        } else {
+          const existing = this.state.calls[this.calls.get(sourceIndex)!];
+          if (existing.name !== call.name) invalid('Tool identity changed during streaming');
+          // Gemini functionCall args are complete objects; a repeated id must be an exact duplicate.
+          if (argumentsText !== existing.arguments) invalid('Tool arguments changed during streaming');
+        }
+      } else if (part.text == null && part.inlineData == null && part.fileData == null) continue;
+      else invalid('Unsupported Gemini streaming part');
     }
     if (candidate.finishReason) this.state.finish = responseFinish(candidate.finishReason, 'gemini', !!this.state.calls.length);
   }

@@ -4,7 +4,7 @@
 
 A Cloudflare Workers + D1 model gateway with a Chinese administration dashboard, channel management, model aliases, streaming tests and request logs.
 
-Supports OpenAI Chat Completions, OpenAI Responses, Anthropic Messages and Gemini. A channel can use automatic protocol negotiation or a fixed upstream protocol. Native requests pass through without conversion; cross-protocol requests convert supported text, images and custom function tools, and reject unsupported semantics explicitly.
+Supports OpenAI Chat Completions, OpenAI Responses, Anthropic Messages and Gemini. A channel can use automatic protocol negotiation or a fixed upstream protocol. Native requests pass through without conversion; cross-protocol requests convert supported text, images and custom function tools, and reject unsupported semantics explicitly. Converted responses keep text and tool calls in their original order. Gemini thinking metadata is ignored and thinking text is not emitted as answer content.
 
 ## Local Development
 

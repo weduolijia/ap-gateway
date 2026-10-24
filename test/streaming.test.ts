@@ -241,7 +241,7 @@ describe('stream protocol conversion', () => {
     ['responses', [named('response.output_item.added', { output_index: 0, item: { type: 'web_search_call', status: 'in_progress' } })], /web_search_call/],
     ['anthropic', [named('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'orphan' } })], /out-of-order/],
     ['anthropic', [named('content_block_start', { index: 0, content_block: { type: 'thinking', thinking: '' } })], /thinking/],
-    ['gemini', [frame({ candidates: [{ content: { parts: [{ text: 'thought', thought: true }] } }] })], /thought/],
+    ['gemini', [frame({ candidates: [{ content: { parts: [{ executableCode: { language: 'PYTHON', code: 'x' } }] } }] })], /executableCode/],
     ['gemini', [frame({ candidates: [{ finishReason: 'MALFORMED_FUNCTION_CALL' }] })], /did not complete successfully/],
   ];
   for (const [from, frames, error] of invalidStreams) it(`rejects unsupported or invalid ${from} SSE: ${error.source}`, async () => {
@@ -316,7 +316,9 @@ describe('stream monitoring', () => {
   it('propagates a provider error without reporting success', async () => {
     const input = [named('error', { error: { type: 'overloaded_error', message: 'try later' } })];
     const { output, complete } = monitor(source(input), 'anthropic');
-    expect(await collect(output)).toBe(input.join(''));
+    const text = await collect(output);
+    expect(text).toContain('try later');
+    expect(text).not.toContain('overloaded_error');
     expect(complete.mock.calls[0][0]).toMatchObject({ outcome: 'error', error: 'upstream_stream_error', errorMessage: 'try later' });
   });
 

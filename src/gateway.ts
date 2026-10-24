@@ -181,7 +181,7 @@ export async function gateway(request: Request, env: Bindings, ctx: { waitUntil(
       clearTimeout(deadline);
       if (!response.body || !response.headers.get('content-type')?.includes('text/event-stream')) { await response.body?.cancel(); throw new AppError('上游没有返回 SSE 流；网关不会将完整 JSON 伪装成流', 502, 'upstream_not_streaming'); }
       const translated = convertStream(response.body, selected, incoming, model);
-      const observed = monitorStream(translated, incoming, { started, heartbeatMs: settings.heartbeatMs, timeoutMs: settings.streamTimeoutMs, abort: () => controller.abort(), complete: result => {
+      const observed = monitorStream(translated, incoming, { started, heartbeatMs: settings.heartbeatMs, timeoutMs: settings.streamTimeoutMs, abort: () => controller.abort(), sanitize: message => sanitizeUpstreamText(message, secrets, 600) ?? '上游返回错误事件', complete: result => {
         cleanup();
         const outcome = request.signal.aborted ? 'cancelled' : result.outcome;
         log.firstByteMs = result.firstByteMs; log.outcome = outcome; log.error = outcome === 'cancelled' ? 'client_cancelled' : result.error;

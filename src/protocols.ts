@@ -1,7 +1,8 @@
 /**
  * Stateless, explicit protocol conversion. Same-protocol requests are untouched.
  * Responses/Gemini field mappings adapted from cloudflare-llm-gateway (MIT).
- * See THIRD_PARTY_NOTICES.md. Unsupported semantics are rejected, never filtered.
+ * See THIRD_PARTY_NOTICES.md. Unsupported semantics are rejected, never silently filtered;
+ * Gemini thinking metadata (thought/thoughtSignature) is ignored because it is not answer content.
  */
 import type { Protocol } from './types';
 
@@ -16,7 +17,8 @@ type ChatRequest = {
   format?: Obj; effort?: string; summary?: string; verbosity?: string; seed?: number; topK?: number; openai?: Obj;
 };
 type Usage = { input: number; output: number; total: number; cached: number; cacheWrite: number; reasoning: number };
-export type ChatResponse = { id: string; created: number; content: Part[]; calls: Call[]; refusal?: string; finish: string; usage?: Usage };
+export type Segment = { kind: 'content'; part: Part } | { kind: 'refusal'; text: string } | { kind: 'call'; callIndex: number };
+export type ChatResponse = { id: string; created: number; content: Part[]; calls: Call[]; refusal?: string; finish: string; usage?: Usage; segments?: Segment[] };
 
 export class ProtocolConversionError extends Error {
   readonly code = 'unsupported_protocol_conversion';
@@ -151,7 +153,7 @@ function validateRole(role: any): string {
 function readCalls(value: any, path: string): Call[] {
   return array(value, path).map((t, i) => {
     object(t, path); keys(t, ['id', 'type', 'function'], `${path}[${i}]`);
-    if (t.type !== 'function') fail('Only function tool calls can be converted');
+    if (t.type != null && t.type !== 'function') fail('Only function tool calls can be converted');
     const f = object(t.function, `${path}[${i}].function`); keys(f, ['name', 'arguments'], 'tool function');
     return { id: nonempty(t.id, 'tool call id'), name: nonempty(f.name, 'function name'), arguments: args(f.arguments ?? '{}', 'function arguments') };
   });
@@ -273,8 +275,8 @@ function readAnthropic(body: Obj): ChatRequest {
   const choice = readChoice(body.tool_choice, 'anthropic');
   return { messages, tools, choice, maxTokens: body.max_tokens, temperature: body.temperature, topP: body.top_p, topK: body.top_k, stop: normalizeStop(body.stop_sequences), parallel: body.tool_choice?.disable_parallel_tool_use == null ? undefined : !body.tool_choice.disable_parallel_tool_use };
 }
-function geminiPart(p: Obj): Part {
-  keys(p, ['text', 'inlineData', 'fileData'], 'gemini part');
+function geminiPart(p: Obj, response = false): Part {
+  keys(p, response ? ['text', 'inlineData', 'fileData', 'thought', 'thoughtSignature', 'partMetadata', 'mediaResolution', 'mediaProcessing'] : ['text', 'inlineData', 'fileData'], 'gemini part');
   if (typeof p.text === 'string') return { type: 'text', text: p.text };
   if (p.inlineData) { const s = object(p.inlineData, 'inlineData'); keys(s, ['mimeType', 'data'], 'inlineData'); return image(`data:${s.mimeType};base64,${s.data}`); }
   if (p.fileData) { const s = object(p.fileData, 'fileData'); keys(s, ['mimeType', 'fileUri'], 'fileData'); return image(s.fileUri, undefined, s.mimeType); }
@@ -285,7 +287,7 @@ function readGemini(body: Obj): ChatRequest {
   const messages: Message[] = [];
   if (body.systemInstruction) {
     const sys = object(body.systemInstruction, 'systemInstruction'); keys(sys, ['role', 'parts'], 'systemInstruction');
-    const content = array(sys.parts, 'systemInstruction.parts').map(geminiPart); onlyText(content, 'systemInstruction'); messages.push({ role: 'system', content });
+    const content = array(sys.parts, 'systemInstruction.parts').map(part => geminiPart(part)); onlyText(content, 'systemInstruction'); messages.push({ role: 'system', content });
   }
   let sequence = 0; const pending: Call[] = [];
   for (const m of array(body.contents, 'contents')) {
@@ -489,14 +491,17 @@ function usage(body: Obj, from: Protocol): Usage | undefined {
 }
 function finish(value: any, from: Protocol, calls: boolean): string {
   if (from === 'openai') {
-    if (!['stop', 'length', 'tool_calls', 'content_filter'].includes(value)) bad(`Unsupported or absent upstream finish_reason: ${String(value)}`);
-    return value;
+    if (!['stop', 'length', 'tool_calls', 'content_filter', 'function_call'].includes(value)) bad(`Unsupported or absent upstream finish_reason: ${String(value)}`);
+    if (value === 'function_call') return calls ? 'tool_calls' : 'stop';
+    return value === 'stop' && calls ? 'tool_calls' : value;
   }
   if (from === 'anthropic') {
     if (['end_turn', 'stop_sequence'].includes(value)) return calls ? 'tool_calls' : 'stop';
     if (value === 'tool_use') return 'tool_calls';
     if (value === 'max_tokens') return 'length';
     if (value === 'refusal') return 'content_filter';
+    // Both mean the turn did not complete; report truncation instead of a gateway error.
+    if (value === 'model_context_window_exceeded' || value === 'pause_turn') return 'length';
     bad(`Unsupported or absent Anthropic stop_reason: ${String(value)}`);
   }
   if (from === 'gemini') {
@@ -510,14 +515,25 @@ function finish(value: any, from: Protocol, calls: boolean): string {
 function responseCanonical(body: Obj, from: Protocol): ChatResponse {
   if (body.error) bad(`Upstream returned an error: ${body.error.message ?? body.error.type ?? 'unknown error'}`);
   const c: ChatResponse = { id: String(body.id ?? body.responseId ?? crypto.randomUUID()), created: numeric(body.created ?? body.created_at) || Math.floor(Date.now() / 1000), content: [], calls: [], finish: 'stop', usage: usage(body, from) };
+  const segments: Segment[] = [];
+  const addContent = (part: Part) => { c.content.push(part); segments.push({ kind: 'content', part }); };
+  const addRefusal = (text: string) => { c.refusal = (c.refusal ?? '') + text; segments.push({ kind: 'refusal', text }); };
+  const addCall = (call: Call) => { segments.push({ kind: 'call', callIndex: c.calls.length }); c.calls.push(call); };
   if (from === 'openai') {
     const choices = array(body.choices, 'choices'); if (choices.length !== 1) fail('Cross-protocol conversion supports one completion only');
-    const m = object(choices[0].message, 'message'); keys(m, ['role', 'content', 'tool_calls', 'refusal', 'annotations'], 'response.message');
+    const m = object(choices[0].message, 'message'); keys(m, ['role', 'content', 'tool_calls', 'function_call', 'refusal', 'annotations'], 'response.message');
     if (m.role != null && m.role !== 'assistant') bad('Upstream output role must be assistant');
     if (m.annotations?.length) fail('Cross-protocol annotated/cited text is not supported');
     if (choices[0].logprobs != null) fail('Cross-protocol token log probabilities are not supported');
-    c.content = textParts(m.content, 'response.content'); if (m.tool_calls) c.calls = readCalls(m.tool_calls, 'tool_calls');
-    if (m.refusal != null) c.refusal = string(m.refusal, 'refusal'); c.finish = finish(choices[0].finish_reason, from, !!c.calls.length);
+    for (const part of textParts(m.content, 'response.content')) addContent(part);
+    if (m.refusal != null) addRefusal(string(m.refusal, 'refusal'));
+    if (m.tool_calls != null && m.function_call != null) bad('Upstream returned both tool_calls and legacy function_call');
+    if (m.tool_calls) for (const call of readCalls(m.tool_calls, 'tool_calls')) addCall(call);
+    if (m.function_call != null) {
+      const f = object(m.function_call, 'function_call'); keys(f, ['name', 'arguments'], 'function_call');
+      addCall({ id: `call_${crypto.randomUUID()}`, name: nonempty(f.name, 'function name'), arguments: args(f.arguments ?? '{}', 'function arguments') });
+    }
+    c.finish = finish(choices[0].finish_reason, from, !!c.calls.length);
   } else if (from === 'responses') {
     if (!['completed', 'incomplete'].includes(body.status)) bad(`Responses upstream status is ${String(body.status)}`);
     if (body.status === 'incomplete') {
@@ -531,51 +547,97 @@ function responseCanonical(body: Obj, from: Protocol): ChatResponse {
       } else if (item.type === 'message') {
         if (item.role && item.role !== 'assistant') bad('Responses output message must have assistant role');
         for (const p of array(item.content, 'message.content')) {
-          if (p.type === 'refusal') { c.refusal = (c.refusal ?? '') + string(p.refusal, 'refusal'); continue; }
-          c.content.push(...textParts([p], 'output.content'));
+          if (p.type === 'refusal') { addRefusal(string(p.refusal, 'refusal')); continue; }
+          for (const part of textParts([p], 'output.content')) addContent(part);
         }
-      } else if (item.type === 'function_call') c.calls.push({ id: nonempty(item.call_id, 'call_id'), name: nonempty(item.name, 'function name'), arguments: args(item.arguments ?? '{}', 'function arguments') });
+      } else if (item.type === 'function_call') addCall({ id: nonempty(item.call_id, 'call_id'), name: nonempty(item.name, 'function name'), arguments: args(item.arguments ?? '{}', 'function arguments') });
       else fail(`Unsupported Responses output item ${item.type}`);
     }
     if (c.finish === 'stop' && c.calls.length) c.finish = 'tool_calls';
   } else if (from === 'anthropic') {
     for (const p of array(body.content, 'content')) {
-      if (p.type === 'tool_use') { keys(p, ['type', 'id', 'name', 'input'], 'tool_use'); c.calls.push({ id: nonempty(p.id, 'tool id'), name: nonempty(p.name, 'function name'), arguments: args(p.input ?? {}, 'tool input') }); }
-      else c.content.push(anthropicPart(p));
+      if (p.type === 'tool_use') { keys(p, ['type', 'id', 'name', 'input'], 'tool_use'); addCall({ id: nonempty(p.id, 'tool id'), name: nonempty(p.name, 'function name'), arguments: args(p.input ?? {}, 'tool input') }); }
+      else addContent(anthropicPart(p));
     }
     c.finish = finish(body.stop_reason, from, !!c.calls.length);
   } else {
     const candidates = array(body.candidates ?? [], 'candidates');
-    if (!candidates.length && body.promptFeedback?.blockReason) { c.finish = 'content_filter'; return c; }
+    if (!candidates.length && body.promptFeedback?.blockReason) { c.finish = 'content_filter'; c.segments = segments; return c; }
     if (candidates.length !== 1) fail('Cross-protocol conversion requires one Gemini candidate');
     if (candidates[0].citationMetadata?.citations?.length || candidates[0].groundingMetadata) fail('Gemini cited/grounded output requires same-protocol routing');
     for (const p of array(candidates[0].content?.parts ?? [], 'candidate.parts')) {
-      if (p.functionCall) { keys(p, ['functionCall'], 'functionCall part'); const f = object(p.functionCall, 'functionCall'); keys(f, ['id', 'name', 'args'], 'functionCall'); c.calls.push({ id: f.id ?? `call_${c.calls.length}`, name: nonempty(f.name, 'function name'), arguments: args(f.args ?? {}, 'function args') }); }
-      else c.content.push(geminiPart(p));
+      if (p.thought === true) continue;
+      if (p.functionCall) {
+        keys(p, ['functionCall', 'thoughtSignature', 'partMetadata', 'mediaResolution', 'mediaProcessing'], 'functionCall part');
+        const f = object(p.functionCall, 'functionCall'); keys(f, ['id', 'name', 'args', 'thoughtSignature'], 'functionCall');
+        addCall({ id: f.id ?? `call_${c.calls.length}`, name: nonempty(f.name, 'function name'), arguments: args(f.args ?? {}, 'function args') });
+      } else if (p.text == null && p.inlineData == null && p.fileData == null) continue;
+      else addContent(geminiPart(p, true));
     }
     c.finish = finish(candidates[0].finishReason, from, !!c.calls.length);
   }
+  c.segments = segments;
   return c;
+}
+function segmentsOf(c: ChatResponse): Segment[] {
+  if (c.segments) return c.segments;
+  return [
+    ...c.content.map(part => ({ kind: 'content' as const, part })),
+    ...(c.refusal ? [{ kind: 'refusal' as const, text: c.refusal }] : []),
+    ...c.calls.map((_, callIndex) => ({ kind: 'call' as const, callIndex })),
+  ];
 }
 function encodeResponse(c: ChatResponse, to: Protocol, model: string): Obj {
   const u = c.usage;
-  if (to === 'openai') return clean({ id: c.id, object: 'chat.completion', created: c.created, model, choices: [{ index: 0, message: clean({ role: 'assistant', content: c.content.length ? chatContent(c.content) : c.calls.length || c.refusal ? null : '', refusal: c.refusal, tool_calls: c.calls.length ? c.calls.map(t => ({ id: t.id, type: 'function', function: { name: t.name, arguments: t.arguments } })) : undefined }), finish_reason: c.finish }], usage: u ? { prompt_tokens: u.input, completion_tokens: u.output, total_tokens: u.total, prompt_tokens_details: { cached_tokens: u.cached }, completion_tokens_details: { reasoning_tokens: u.reasoning } } : undefined });
+  const segments = segmentsOf(c);
+  if (to === 'openai') {
+    const content: Part[] = []; let refusal = '';
+    for (const segment of segments) {
+      if (segment.kind === 'content') content.push(segment.part);
+      else if (segment.kind === 'refusal') refusal += segment.text;
+    }
+    return clean({ id: c.id, object: 'chat.completion', created: c.created, model, choices: [{ index: 0, message: clean({ role: 'assistant', content: content.length ? chatContent(content) : c.calls.length || refusal ? null : '', refusal: refusal || undefined, tool_calls: c.calls.length ? c.calls.map(t => ({ id: t.id, type: 'function', function: { name: t.name, arguments: t.arguments } })) : undefined }), finish_reason: c.finish }], usage: u ? { prompt_tokens: u.input, completion_tokens: u.output, total_tokens: u.total, prompt_tokens_details: { cached_tokens: u.cached }, completion_tokens_details: { reasoning_tokens: u.reasoning } } : undefined });
+  }
   if (to === 'responses') {
     const incomplete = c.finish === 'length' || c.finish === 'content_filter'; const output: Obj[] = [];
-    const content: Obj[] = c.content.length ? [{ type: 'output_text', text: onlyText(c.content, 'Responses output'), annotations: [] }] : [];
-    if (c.refusal) content.push({ type: 'refusal', refusal: c.refusal });
-    if (content.length || !c.calls.length) output.push({ id: `msg_${c.id}`, type: 'message', role: 'assistant', status: incomplete ? 'incomplete' : 'completed', content });
-    for (const t of c.calls) output.push({ type: 'function_call', id: `fc_${t.id}`, call_id: t.id, name: t.name, arguments: t.arguments, status: incomplete ? 'incomplete' : 'completed' });
-    return { id: c.id, object: 'response', created_at: c.created, model, status: incomplete ? 'incomplete' : 'completed', error: null, incomplete_details: incomplete ? { reason: c.finish === 'length' ? 'max_output_tokens' : 'content_filter' } : null, output, output_text: onlyText(c.content, 'Responses output'), usage: u ? { input_tokens: u.input, output_tokens: u.output, total_tokens: u.total, input_tokens_details: { cached_tokens: u.cached }, output_tokens_details: { reasoning_tokens: u.reasoning } } : null };
+    let content: Obj[] = []; let text = ''; let messages = 0;
+    const flush = () => {
+      if (!content.length) return;
+      output.push({ id: messages === 0 ? `msg_${c.id}` : `msg_${c.id}_${messages}`, type: 'message', role: 'assistant', status: incomplete ? 'incomplete' : 'completed', content });
+      messages++; content = [];
+    };
+    for (const segment of segments) {
+      if (segment.kind === 'call') {
+        flush();
+        const t = c.calls[segment.callIndex];
+        output.push({ type: 'function_call', id: `fc_${t.id}`, call_id: t.id, name: t.name, arguments: t.arguments, status: incomplete ? 'incomplete' : 'completed' });
+      } else if (segment.kind === 'refusal') content.push({ type: 'refusal', refusal: segment.text });
+      else {
+        const value = onlyText([segment.part], 'Responses output');
+        content.push({ type: 'output_text', text: value, annotations: [] });
+        text += value;
+      }
+    }
+    flush();
+    if (!output.length) output.push({ id: `msg_${c.id}`, type: 'message', role: 'assistant', status: incomplete ? 'incomplete' : 'completed', content: [] });
+    return { id: c.id, object: 'response', created_at: c.created, model, status: incomplete ? 'incomplete' : 'completed', error: null, incomplete_details: incomplete ? { reason: c.finish === 'length' ? 'max_output_tokens' : 'content_filter' } : null, output, output_text: text, usage: u ? { input_tokens: u.input, output_tokens: u.output, total_tokens: u.total, input_tokens_details: { cached_tokens: u.cached }, output_tokens_details: { reasoning_tokens: u.reasoning } } : null };
   }
   if (to === 'anthropic') {
-    const content: Obj[] = c.content.map(toAnthropicPart); if (c.refusal) content.push({ type: 'text', text: c.refusal });
-    for (const t of c.calls) content.push({ type: 'tool_use', id: t.id, name: t.name, input: argsObject(t.arguments, 'tool arguments') });
+    const content: Obj[] = [];
+    for (const segment of segments) {
+      if (segment.kind === 'call') { const t = c.calls[segment.callIndex]; content.push({ type: 'tool_use', id: t.id, name: t.name, input: argsObject(t.arguments, 'tool arguments') }); }
+      else if (segment.kind === 'refusal') content.push({ type: 'text', text: segment.text });
+      else content.push(toAnthropicPart(segment.part));
+    }
     if (!content.length) content.push({ type: 'text', text: '' });
     return clean({ id: c.id, type: 'message', role: 'assistant', model, content, stop_reason: c.finish === 'tool_calls' ? 'tool_use' : c.finish === 'length' ? 'max_tokens' : c.finish === 'content_filter' ? 'refusal' : 'end_turn', stop_sequence: null, usage: u ? { input_tokens: Math.max(0, u.input - u.cached - u.cacheWrite), output_tokens: u.output, cache_read_input_tokens: u.cached, cache_creation_input_tokens: u.cacheWrite } : undefined });
   }
-  const parts: Obj[] = c.content.map(toGeminiPart); if (c.refusal) parts.push({ text: c.refusal });
-  for (const t of c.calls) parts.push({ functionCall: { id: t.id, name: t.name, args: argsObject(t.arguments, 'tool arguments') } });
+  const parts: Obj[] = [];
+  for (const segment of segments) {
+    if (segment.kind === 'call') { const t = c.calls[segment.callIndex]; parts.push({ functionCall: { id: t.id, name: t.name, args: argsObject(t.arguments, 'tool arguments') } }); }
+    else if (segment.kind === 'refusal') parts.push({ text: segment.text });
+    else parts.push(toGeminiPart(segment.part));
+  }
   return clean({ responseId: c.id, modelVersion: model, candidates: [{ index: 0, content: { role: 'model', parts }, finishReason: c.finish === 'length' ? 'MAX_TOKENS' : c.finish === 'content_filter' ? 'SAFETY' : 'STOP' }], usageMetadata: u ? { promptTokenCount: u.input, candidatesTokenCount: Math.max(0, u.output - u.reasoning), totalTokenCount: u.total, cachedContentTokenCount: u.cached, thoughtsTokenCount: u.reasoning } : undefined });
 }
 export function convertResponse(body: any, from: Protocol, to: Protocol, model: string): any {

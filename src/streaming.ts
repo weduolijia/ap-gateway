@@ -12,14 +12,16 @@ export function streamErrorFrame(protocol: Protocol, message: string, sequenceNu
   return new TextEncoder().encode(`event: error\ndata: ${JSON.stringify(data)}\n\n`);
 }
 export function monitorStream(source: ReadableStream<Uint8Array>, protocol: Protocol, options: {
-  started: number; heartbeatMs: number; timeoutMs: number; abort: () => void; complete: (result: StreamResult) => void;
+  started: number; heartbeatMs: number; timeoutMs: number; abort: () => void; complete: (result: StreamResult) => void; sanitize?: (message: string) => string;
 }): ReadableStream<Uint8Array> {
   const reader = source.getReader();
   const decoder = new TextDecoder();
+  const sanitize = options.sanitize ?? ((value: string) => value);
   let terminal = false;
   let finishReason = false;
   let streamFailure: string | undefined;
   let streamMessage: string | undefined;
+  let errorSeen = false;
   let finished = false;
   let released = false;
   let firstByteMs: number | null = null;
@@ -45,6 +47,7 @@ export function monitorStream(source: ReadableStream<Uint8Array>, protocol: Prot
       streamFailure = 'upstream_stream_error';
       streamMessage ??= upstreamMessage(data);
       terminal = true;
+      errorSeen = true;
       return;
     }
     if (protocol === 'openai') {
@@ -58,7 +61,7 @@ export function monitorStream(source: ReadableStream<Uint8Array>, protocol: Prot
         terminal = true;
         if (type !== 'response.completed') {
           streamFailure ??= type === 'response.incomplete' ? 'upstream_generation_incomplete' : 'upstream_stream_error';
-          if (type === 'response.failed') streamMessage ??= upstreamMessage(data);
+          if (type === 'response.failed') { streamMessage ??= upstreamMessage(data); errorSeen = true; }
         }
       }
     } else if (protocol === 'anthropic') {
@@ -113,7 +116,10 @@ export function monitorStream(source: ReadableStream<Uint8Array>, protocol: Prot
         pending = undefined;
         if (next.done) {
           parser.feed(decoder.decode());
-          if (!terminal) {
+          if (errorSeen) {
+            controller.enqueue(streamErrorFrame(protocol, sanitize(streamMessage ?? '上游返回错误事件'), sequenceNumber));
+            finish('error', 'upstream_stream_error');
+          } else if (!terminal) {
             controller.enqueue(streamErrorFrame(protocol, '上游流在结束事件前断开，请勿将本次响应视为完整结果', sequenceNumber));
             finish('error', streamFailure ?? 'upstream_stream_truncated');
           } else finish(streamFailure ? 'error' : 'ok', streamFailure);
@@ -124,6 +130,14 @@ export function monitorStream(source: ReadableStream<Uint8Array>, protocol: Prot
         if (firstByteMs === null) firstByteMs = Date.now() - options.started;
         lastData = Date.now();
         parser.feed(decoder.decode(next.value, { stream: true }));
+        // Drop the raw chunk: upstream error text must not reach clients unfiltered.
+        if (errorSeen) {
+          controller.enqueue(streamErrorFrame(protocol, sanitize(streamMessage ?? '上游返回错误事件'), sequenceNumber));
+          finish('error', 'upstream_stream_error');
+          controller.close();
+          void cleanup();
+          return;
+        }
         controller.enqueue(next.value);
         if (terminal && protocol !== 'gemini') {
           finish(streamFailure ? 'error' : 'ok', streamFailure);
@@ -133,13 +147,15 @@ export function monitorStream(source: ReadableStream<Uint8Array>, protocol: Prot
       } catch (error) {
         if (finished) return;
         const conversion = error instanceof Error && 'code' in error && error.code === 'unsupported_protocol_conversion';
-        const message = error instanceof Error && error.message.includes('超时') ? error.message : conversion ? error.message : '上游流读取失败或协议事件无效';
+        const timeout = error instanceof Error && error.message.includes('超时');
+        const message = timeout ? error.message : conversion ? error.message : '上游流读取失败或协议事件无效';
+        const code = conversion ? 'unsupported_protocol_conversion' : timeout ? 'upstream_timeout' : 'upstream_stream_error';
         if (conversion && error instanceof Error) streamMessage ??= error.message;
         options.abort();
         void cleanup(error);
-        controller.enqueue(streamErrorFrame(protocol, message, sequenceNumber));
+        controller.enqueue(streamErrorFrame(protocol, sanitize(message), sequenceNumber));
         controller.close();
-        finish('error', message);
+        finish('error', code);
       }
     },
     async cancel(reason) {
