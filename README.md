@@ -134,11 +134,15 @@ The overview page shows a runtime panel backed by `GET /api/runtime` (administra
 - **Workers usage**: requests, 5xx count and durations recorded by the gateway itself for the current UTC day, plus free-plan reference limits. These are not account quota usage.
 - **Account-level metrics**: Workers requests/CPU and D1 rows read/written are account-scoped and require a token with Analytics read permission. Without one the panel says so instead of estimating.
 
-To enable account metrics, create an API token with Account Analytics read access and store it as a secret:
+Account-level data uses two optional tokens with different scopes:
 
 ```powershell
+npx wrangler secret put CF_ANALYTICS_TOKEN --env cloud
 npx wrangler secret put CF_API_TOKEN --env cloud
 ```
+
+- `CF_ANALYTICS_TOKEN` needs Account Analytics read access and powers the GraphQL queries for Workers requests/CPU and D1 rows read/written.
+- `CF_API_TOKEN` needs D1 read access and is only used to fetch the database `file_size`.
 
 Set `CF_ACCOUNT_ID` and `CF_D1_DATABASE_ID` in the cloud environment to your own values.
 

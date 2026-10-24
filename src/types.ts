@@ -73,4 +73,5 @@ export interface Bindings {
   CF_ACCOUNT_ID?: string;
   CF_D1_DATABASE_ID?: string;
   CF_API_TOKEN?: string;
+  CF_ANALYTICS_TOKEN?: string;
 }

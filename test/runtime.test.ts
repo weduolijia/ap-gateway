@@ -64,7 +64,7 @@ describe('runtime status without an API token', () => {
 });
 
 describe('runtime status with a metadata token', () => {
-  const tokenEnv = { CF_ACCOUNT_ID: 'acc', CF_D1_DATABASE_ID: 'db-id', CF_API_TOKEN: 'cf-token' };
+  const tokenEnv = { CF_ACCOUNT_ID: 'acc', CF_D1_DATABASE_ID: 'db-id', CF_API_TOKEN: 'cf-token', CF_ANALYTICS_TOKEN: 'analytics-token' };
 
   it('reads the database file size from the metadata endpoint and calculates the share of the limit', async () => {
     const seen: string[] = [];
@@ -101,6 +101,19 @@ describe('runtime status with a metadata token', () => {
     const view = await runtimeView(fakeDb(), tokenEnv);
     expect(view.workers.accountUsage).toMatchObject({ available: true, requests: 1234, errors: 3, cpuTimeP50Ms: 4.35, cpuTimeP99Ms: 120.7 });
     expect(view.d1AccountUsage).toMatchObject({ available: true, rowsRead: 5000, rowsWritten: 120 });
+  });
+  it('accepts a separate analytics token and prefers it over the metadata token', async () => {
+    const auth: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      auth.push(`${String(url).includes('graphql') ? 'graphql' : 'metadata'}:${new Headers(init.headers).get('authorization')}`);
+      if (String(url).includes('graphql')) return Response.json({ data: { viewer: { accounts: [{ workersInvocationsAdaptive: [{ dimensions: { scriptName: 'ap-gateway' }, sum: { requests: 5, errors: 0 }, quantiles: { cpuTimeP50: 1000, cpuTimeP99: 2000 } }], d1AnalyticsAdaptiveGroups: [{ dimensions: { databaseId: 'db-id' }, sum: { rowsRead: 10, rowsWritten: 2 } }] }] } } });
+      return Response.json({ result: { file_size: 1024 } });
+    }));
+    const view = await runtimeView(fakeDb(), { ...tokenEnv, CF_API_TOKEN: 'metadata-token', CF_ANALYTICS_TOKEN: 'analytics-token' });
+    expect(view.workers.accountUsage.available).toBe(true);
+    expect(view.d1AccountUsage).toMatchObject({ available: true, rowsRead: 10, rowsWritten: 2 });
+    expect(auth).toContain('graphql:Bearer analytics-token');
+    expect(auth).toContain('metadata:Bearer metadata-token');
   });
   it('degrades gracefully when GraphQL returns errors or a non-200', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({ data: null, errors: [{ message: 'budget' }] })));

@@ -62,7 +62,10 @@ export interface RuntimeView {
   tokenConfigured: boolean;
 }
 
-type Env = Pick<Bindings, 'CF_ACCOUNT_ID' | 'CF_D1_DATABASE_ID' | 'CF_API_TOKEN'>;
+type Env = Pick<Bindings, 'CF_ACCOUNT_ID' | 'CF_D1_DATABASE_ID' | 'CF_API_TOKEN' | 'CF_ANALYTICS_TOKEN'>;
+
+// Account-level analytics and D1 metadata need different scopes, so the panel accepts two tokens.
+function analyticsToken(env: Env): string | undefined { return env.CF_ANALYTICS_TOKEN || env.CF_API_TOKEN; }
 
 const TABLE_NAME = /^[A-Za-z0-9_]+$/;
 
@@ -112,11 +115,12 @@ async function d1MetadataSize(env: Env): Promise<{ size: number | null; note: st
 }
 
 async function graphql(env: Env, query: string): Promise<any | null> {
-  if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return null;
+  const token = analyticsToken(env);
+  if (!token || !env.CF_ACCOUNT_ID) return null;
   try {
     const response = await fetch('https://api.cloudflare.com/client/v4/graphql', {
       method: 'POST',
-      headers: { authorization: `Bearer ${env.CF_API_TOKEN}`, 'content-type': 'application/json' },
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ query }),
     });
     if (!response.ok) { await response.body?.cancel(); return null; }
@@ -174,8 +178,8 @@ export async function workersStatus(db: D1Database, env: Env): Promise<WorkersSt
     source = 'request-log';
   } catch { /* 面板显示不可用 */ }
 
-  if (!env.CF_API_TOKEN) {
-    accountUsage.note = 'CF_API_TOKEN is not set; account-level Workers usage and CPU quota are unavailable.';
+  if (!analyticsToken(env)) {
+    accountUsage.note = 'CF_ANALYTICS_TOKEN is not set; account-level Workers usage and CPU quota are unavailable.';
   } else {
     // date_geq/date_leq 使用 UTC 日期；只统计本 Worker 的脚本名。
     const today = dayStart.toISOString().slice(0, 10);
@@ -199,7 +203,7 @@ export async function workersStatus(db: D1Database, env: Env): Promise<WorkersSt
 }
 
 export async function d1AccountUsage(env: Env): Promise<D1AccountUsage> {
-  if (!env.CF_API_TOKEN) return { available: false, rowsRead: null, rowsWritten: null, note: 'CF_API_TOKEN is not set; account-level D1 rows read/written are unavailable.' };
+  if (!analyticsToken(env)) return { available: false, rowsRead: null, rowsWritten: null, note: 'CF_ANALYTICS_TOKEN is not set; account-level D1 rows read/written are unavailable.' };
   const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
   const today = dayStart.toISOString().slice(0, 10);
   const payload = await graphql(env, `{ viewer { accounts(filter: {accountTag: "${env.CF_ACCOUNT_ID}"}) { d1AnalyticsAdaptiveGroups(limit: 50, filter: {date_geq: "${today}", date_leq: "${today}"}) { sum { readQueries writeQueries rowsRead rowsWritten } dimensions { databaseId } } } } }`);
@@ -211,5 +215,5 @@ export async function d1AccountUsage(env: Env): Promise<D1AccountUsage> {
 
 export async function runtimeView(db: D1Database, env: Env): Promise<RuntimeView> {
   const [d1, workers, d1Usage] = await Promise.all([d1Status(db, env), workersStatus(db, env), d1AccountUsage(env)]);
-  return { generatedAt: new Date().toISOString(), d1, workers, d1AccountUsage: d1Usage, tokenConfigured: !!env.CF_API_TOKEN };
+  return { generatedAt: new Date().toISOString(), d1, workers, d1AccountUsage: d1Usage, tokenConfigured: !!(env.CF_API_TOKEN || env.CF_ANALYTICS_TOKEN) };
 }
