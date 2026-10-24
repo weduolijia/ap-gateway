@@ -1,0 +1,48 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ap-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-23",
+  "workers_dev": false,
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ap-gateway-db",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "vars": {
+    "APP_ENV": "local",
+    "ALLOW_LOCAL_UPSTREAM": "true",
+    "ALLOW_UNAUTHENTICATED_PUBLIC": "false",
+    "AUTH_ENABLED": "false"
+  },
+  "observability": {
+    "enabled": false
+  },
+  "env": {
+    "cloud": {
+      "name": "ap-gateway",
+      "workers_dev": true,
+      "preview_urls": false,
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "ap-gateway-cloud-db",
+          "database_id": "00000000-0000-0000-0000-000000000000"
+        }
+      ],
+      "vars": {
+        "APP_ENV": "cloud-test",
+        "ALLOW_LOCAL_UPSTREAM": "false",
+        "ALLOW_UNAUTHENTICATED_PUBLIC": "false",
+        "AUTH_ENABLED": "true"
+      }
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "ap-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Workers model gateway with protocol negotiation and a local-first dashboard",
+  "scripts": {
+    "predev": "npm run db:local",
+    "dev": "wrangler dev --ip 127.0.0.1 --port 8787",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:integration": "node verification/local-integration.mjs",
+    "test:keys": "node verification/key-rotation-integration.mjs",
+    "test:auth": "node verification/auth-integration.mjs local",
+    "test:auth:cloud": "node verification/auth-integration.mjs cloud",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "db:local": "wrangler d1 execute ap-gateway-db --local --file=schema.sql",
+    "build:cloud": "wrangler deploy --env cloud --dry-run --outdir dist/cloud",
+    "db:cloud": "wrangler d1 execute ap-gateway-cloud-db --env cloud --remote --file=schema.sql --yes",
+    "deploy": "wrangler deploy --env cloud",
+    "test:cloud": "node verification/cloud-smoke.mjs",
+    "verify": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": { "hono": "^4.0.0", "eventsource-parser": "^3.0.0" },
+  "devDependencies": { "@cloudflare/workers-types": "^5.20261019.1", "typescript": "^5.7.0", "vitest": "^3.0.0", "wrangler": "^4.0.0", "@types/node": "^22.0.0" }
+}
