@@ -67,6 +67,8 @@ Channels support multiple upstream keys with per-instance round-robin selection.
 
 Administrator sessions use HttpOnly cookies and CSRF protection. Passwords use salted PBKDF2 hashes. Active gateway API keys are stored in full for administrator retrieval in addition to their verification hashes. Upstream keys are stored in D1, omitted from configuration exports, and never substituted with gateway or session credentials in authenticated deployments.
 
+Streaming responses forward same-protocol bytes unchanged, but complete upstream `error` events are replaced with a redacted error frame so provider error text never reaches clients unfiltered. Converted streams keep text and tool calls in order, deduplicate repeated Gemini function calls, and map Anthropic `model_context_window_exceeded` and `pause_turn` to a truncated result instead of a gateway error.
+
 ## Verification
 
 ```powershell
@@ -93,6 +95,8 @@ npx wrangler dev --ip=127.0.0.1 --port=8788 --persist-to=.wrangler/auth-verifica
 ```
 
 Then run `npm run test:auth` in another terminal. Cloud tests require `AP_CLOUD_URL` and your own administrator credentials. An optional `AP_WORKERS_URL` enables the second-origin authentication check. Integration tests create and clean up their own temporary channels or keys, but request logs remain.
+
+`test/conversion-regressions.test.ts` covers the streaming and conversion fixes: redacted error frames, Anthropic context-window and pause stop reasons, Gemini thinking metadata, legacy `function_call`, interleaved content ordering, Gemini call deduplication and usage-only chunks.
 
 ## Files And Data
 
