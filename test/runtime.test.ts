@@ -78,6 +78,18 @@ describe('runtime status with a metadata token', () => {
     expect(status.storagePercent).toBe(50);
     expect(seen[0]).toBe('https://api.cloudflare.com/client/v4/accounts/acc/d1/database/db-id');
   });
+  it('falls back to the analytics token for D1 metadata when no metadata token is set', async () => {
+    const auth: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      auth.push(`${String(url).includes('graphql') ? 'graphql' : 'metadata'}:${new Headers(init.headers).get('authorization')}`);
+      if (String(url).includes('graphql')) return Response.json({ data: { viewer: { accounts: [{}] } } });
+      return Response.json({ result: { file_size: 2048 } });
+    }));
+    const status = await d1Status(fakeDb(), { CF_ACCOUNT_ID: 'acc', CF_D1_DATABASE_ID: 'db-id', CF_ANALYTICS_TOKEN: 'analytics-token' });
+    expect(status.sizeBytes).toBe(2048);
+    expect(status.warnings).toEqual([]);
+    expect(auth).toContain('metadata:Bearer analytics-token');
+  });
   it('keeps the panel usable when the metadata endpoint fails', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('forbidden', { status: 403 })));
     const status = await d1Status(fakeDb(), tokenEnv);

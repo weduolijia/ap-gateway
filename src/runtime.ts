@@ -99,11 +99,13 @@ async function tableStats(db: D1Database, warnings: string[]): Promise<TableStat
 }
 
 async function d1MetadataSize(env: Env): Promise<{ size: number | null; note: string }> {
-  if (!env.CF_API_TOKEN) return { size: null, note: 'CF_API_TOKEN is not set; Cloudflare metadata is unavailable' };
+  // A dedicated metadata token wins; otherwise reuse the analytics token, which may already carry D1 read.
+  const token = env.CF_API_TOKEN || analyticsToken(env);
+  if (!token) return { size: null, note: 'Neither CF_API_TOKEN nor CF_ANALYTICS_TOKEN is set; Cloudflare metadata is unavailable' };
   if (!env.CF_ACCOUNT_ID || !env.CF_D1_DATABASE_ID) return { size: null, note: 'CF_ACCOUNT_ID or CF_D1_DATABASE_ID is missing' };
   try {
     const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(env.CF_ACCOUNT_ID)}/d1/database/${encodeURIComponent(env.CF_D1_DATABASE_ID)}`, {
-      headers: { authorization: `Bearer ${env.CF_API_TOKEN}` },
+      headers: { authorization: `Bearer ${token}` },
     });
     if (!response.ok) { await response.body?.cancel(); return { size: null, note: `Metadata API returned HTTP ${response.status}` }; }
     const payload: any = await response.json();

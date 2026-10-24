@@ -142,7 +142,7 @@ npx wrangler secret put CF_API_TOKEN --env cloud
 ```
 
 - `CF_ANALYTICS_TOKEN` needs Account Analytics read access and powers the GraphQL queries for Workers requests/CPU and D1 rows read/written.
-- `CF_API_TOKEN` needs D1 read access and is only used to fetch the database `file_size`.
+- `CF_API_TOKEN` needs D1 read access and is used to fetch the database `file_size`; when it is absent the gateway falls back to `CF_ANALYTICS_TOKEN` if that token also carries D1 read.
 
 Set `CF_ACCOUNT_ID` and `CF_D1_DATABASE_ID` in the cloud environment to your own values.
 
