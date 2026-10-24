@@ -98,6 +98,8 @@ Then run `npm run test:auth` in another terminal. Cloud tests require `AP_CLOUD_
 
 `test/conversion-regressions.test.ts` covers the streaming and conversion fixes: redacted error frames, Anthropic context-window and pause stop reasons, Gemini thinking metadata, legacy `function_call`, interleaved content ordering, Gemini call deduplication and usage-only chunks.
 
+`test/ui-layout.test.ts` pins the layout contracts that the minified markup would otherwise break: every horizontal button row must declare a non-zero `gap` (adjacent `</button><button>` has no whitespace node to space them), and the dialog body must carry padding so its content lines up with the header and footer.
+
 ## Design Tokens
 
 All colours, spacing, radii and type sizes live in `public/theme-tokens.css`, which loads before `public/styles.css`. It defines the light and dark palettes; `styles.css` holds structure and component rules only. Change a token once and every page follows. There are no decorative gradients: surfaces are flat, hierarchy comes from 1px borders, and shadows are reserved for overlays (drawer, dialogs, toasts).

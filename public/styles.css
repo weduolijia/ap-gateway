@@ -329,7 +329,7 @@ button[hidden],[hidden]{display:none!important}
 .detail-dialog header{display:flex;align-items:center;justify-content:space-between;padding:19px 23px;border-bottom:1px solid var(--line)}
 .detail-dialog h2{font-size:var(--fs-lg)}
 .detail-dialog #detail-content{padding:22px 23px;overflow:auto;max-height:55vh;font-size:var(--fs-xs);color:var(--muted);line-height:1.8}
-.detail-dialog footer{padding:14px 23px;border-top:1px solid var(--line);display:flex;justify-content:flex-end}
+.detail-dialog footer{padding:14px 23px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:10px}
 .detail-dialog pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:var(--fs-2xs);background:var(--surface);border:1px solid var(--chart-grid);border-radius:var(--r-sm);padding:13px;line-height:1.8}
 .detail-dialog dl{display:grid;grid-template-columns:110px 1fr;gap:9px 16px;margin:0 0 16px}
 .detail-dialog dt{color:var(--placeholder)}
@@ -518,6 +518,11 @@ input[type=checkbox]{accent-color:var(--action)}
 .password-panel .form-error{margin-bottom:17px}
 .password-panel #password-status{font-size:var(--fs-xs);color:var(--success);line-height:1.8}
 .secret-dialog{width:min(520px,calc(100vw - 36px))}
+/* 正文默认没有内边距，必须与 header/footer 的 24px 对齐，否则内容会贴到弹窗边框 */
+.secret-dialog-body{padding:var(--sp-6) var(--sp-8)}
+.secret-dialog-body>:first-child{margin-top:0}
+/* 勾选行自带的 19px 下外边距会叠在 padding 上，让底部比顶部厚一倍 */
+.secret-dialog-body .checkbox-line{margin-bottom:0}
 .secret-dialog-body>p{color:var(--muted);font-size:var(--fs-sm);line-height:1.9;margin:15px 0 20px}
 .secret-dialog-body .field{font-size:var(--fs-xs)}
 .secret-dialog textarea{font-size:var(--fs-sm);line-height:1.9;overflow-wrap:anywhere;background:var(--surface);resize:none}
