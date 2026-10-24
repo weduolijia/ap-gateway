@@ -10,6 +10,7 @@ const pages = { overview: '网关概览', channels: '渠道管理', playground: 
 const numberFormat = new Intl.NumberFormat('zh-CN');
 const state = {
   channels: [], logs: [], keys: [], status: null, ready: false, loading: false, loadingKeys: false, keysRevision: 0, settingsDirty: false,
+  logCursor: 0, currentPage: 'overview', statsStale: false,
   editingId: null, drawerReturnFocus: null, outputTab: 'content', logFilter: 'all', policyKeyId: null, policyModels: new Set(),
   output: '', raw: '', eventCount: 0, streamController: null, discovered: new Map(),
   responseEnd: { terminal: false, finishReason: false, incompleteReason: '' },
@@ -38,6 +39,8 @@ function clearSensitiveData() {
   state.loading = false;
   state.loadingKeys = false;
   state.settingsDirty = false;
+  state.logCursor = 0;
+  state.statsStale = false;
   state.editingId = null;
   state.drawerReturnFocus = null;
   state.discovered.clear();
@@ -291,7 +294,15 @@ function navigate() {
   byId('breadcrumb-page').textContent = pages[page];
   document.title = `${pages[page]} · AP Gateway`;
   closeSidebar();
-  if (page === 'keys') loadKeys();
+  state.currentPage = page;
+  if (state.ready) {
+    if (page === 'keys') loadKeys();
+    else if (page === 'logs') loadLogs().catch(() => {});
+    else if (page === 'overview') {
+      loadLogs().catch(() => {});
+      if (state.statsStale || !state.status?.stats) loadStatus(true).catch(() => {});
+    } else if (page === 'settings') loadStatus(false).catch(() => {});
+  }
 }
 
 function closeSidebar() {
@@ -426,13 +437,19 @@ function renderTestUpstream(reset = false) {
 function renderStats() {
   if (!state.status) return;
   const stats = state.status.stats;
-  byId('metric-total').textContent = numberFormat.format(stats.total);
-  byId('metric-success').innerHTML = stats.total ? `${stats.successRate}<small>%</small>` : '—';
-  byId('metric-latency').innerHTML = stats.total ? `${numberFormat.format(stats.avgLatencyMs)}<small>ms</small>` : '—';
-  byId('metric-channels').textContent = stats.activeChannels;
+  if (stats) {
+    byId('metric-total').textContent = numberFormat.format(stats.total);
+    byId('metric-success').innerHTML = stats.total ? `${stats.successRate}<small>%</small>` : '—';
+    byId('metric-latency').innerHTML = stats.total ? `${numberFormat.format(stats.avgLatencyMs)}<small>ms</small>` : '—';
+    byId('metric-channels').textContent = stats.activeChannels;
+  }
   byId('metric-channels-foot').textContent = `${state.channels.filter((channel) => !channel.isDemo).length} 个真实渠道 · 另有 1 个内置演示`;
   byId('version-label').textContent = state.status.build ? `v${state.status.version} · ${state.status.build}` : `v${state.status.version}`;
   byId('version-label').title = `运行环境：${state.status.environment}${state.status.build ? `\n构建日期：${state.status.build}` : ''}`;
+}
+
+function renderTraffic() {
+  if (!state.status) return;
   const currentHour = Math.floor(Date.now() / 3600000);
   const counts = Array.from({ length: 24 }, () => 0);
   for (const log of state.logs) {
@@ -475,22 +492,87 @@ function renderSettings() {
   byId('setting-retention').value = settings.logRetention;
 }
 
+async function loadStatus(stats) {
+  const status = await api(`/api/status${stats ? '' : '?stats=0'}`);
+  state.status = status;
+  if (stats) state.statsStale = false;
+  renderEnvironment();
+  renderStats();
+  renderSettings();
+}
+
+async function loadChannels() {
+  const version = auth.version;
+  const result = await api('/api/channels');
+  if (version !== auth.version || !auth.authenticated) return;
+  state.channels = result.channels;
+  renderChannels();
+  renderSelectors();
+  renderStats();
+}
+
+async function refreshVisiblePage() {
+  const version = auth.version;
+  try {
+    if (state.currentPage === 'overview') {
+      await Promise.all([loadStatus(true), loadChannels(), loadLogs()]);
+    } else if (state.currentPage === 'channels') {
+      await Promise.all([loadStatus(false), loadChannels()]);
+    } else if (state.currentPage === 'logs') {
+      await loadLogs();
+    } else if (state.currentPage === 'keys') {
+      await loadKeys(true);
+    } else if (state.currentPage === 'settings') {
+      await loadStatus(false);
+    }
+    if (version !== auth.version || !auth.authenticated) return;
+    byId('connection-label').textContent = '网关已连接';
+    byId('connection-dot').classList.remove('offline');
+  } catch (error) {
+    if (version !== auth.version || !auth.authenticated) return;
+    byId('connection-label').textContent = '连接失败';
+    byId('connection-dot').classList.add('offline');
+  }
+}
+
+function mergeLogs(incoming, reset) {
+  if (reset) state.logs = [];
+  const known = new Set(state.logs.map((log) => log.id));
+  const fresh = incoming.filter((log) => !known.has(log.id));
+  if (!fresh.length && !reset) return false;
+  state.logs = [...fresh, ...state.logs]
+    .sort((left, right) => new Date(right.time) - new Date(left.time))
+    .slice(0, 500);
+  return true;
+}
+
+async function loadLogs() {
+  const version = auth.version;
+  const result = await api(state.logCursor ? `/api/logs?since=${state.logCursor}` : '/api/logs');
+  if (version !== auth.version || !auth.authenticated) return;
+  state.logCursor = result.cursor ?? state.logCursor;
+  if (mergeLogs(result.logs, !!result.reset) || !state.logCursor) {
+    renderLogs();
+    renderTraffic();
+  }
+}
+
 async function loadAll(notify = false) {
   if (state.loading || !auth.authenticated) return;
   const version = auth.version;
   state.loading = true;
   try {
-    const [status, channelResult, logResult] = await Promise.all([api('/api/status'), api('/api/channels'), api('/api/logs')]);
+    const [channelResult, logResult] = await Promise.all([api('/api/channels'), api(state.logCursor ? `/api/logs?since=${state.logCursor}` : '/api/logs'), loadStatus(state.currentPage === 'overview')]);
     if (version !== auth.version || !auth.authenticated) return;
-    state.status = status;
     state.channels = channelResult.channels;
-    state.logs = logResult.logs;
-    renderEnvironment();
+    state.logCursor = logResult.cursor ?? state.logCursor;
+    mergeLogs(logResult.logs, !!logResult.reset);
     renderChannels();
     renderSelectors();
     renderStats();
     renderSettings();
     renderLogs();
+    renderTraffic();
     if (state.keys.length) renderKeys();
     state.ready = true;
     byId('connection-label').textContent = '网关已连接';
@@ -1140,7 +1222,9 @@ async function sendTest(event) {
       byId('test-stop').hidden = true;
       byId('test-duration').innerHTML = `${Math.round(performance.now() - started)}<small> ms</small>`;
       renderOutput();
-      setTimeout(() => { if (version === auth.version) loadAll(); }, 400);
+      // A test just added a log; refresh the list incrementally and defer stats until the overview is shown.
+      state.statsStale = true;
+      setTimeout(() => { if (version === auth.version) loadLogs().catch(() => {}); }, 400);
     }
   }
 }
@@ -1256,7 +1340,8 @@ function setup() {
   });
   byId('sidebar-backdrop').addEventListener('click', closeSidebar);
   all('[data-open-channel]').forEach((button) => button.addEventListener('click', () => openChannel()));
-  for (const id of ['refresh-all', 'refresh-channels', 'refresh-logs']) byId(id).addEventListener('click', () => withButton(byId(id), () => loadAll(true)));
+  byId('refresh-all').addEventListener('click', () => withButton(byId('refresh-all'), () => loadAll(true)));
+  for (const [id, loader] of [['refresh-channels', () => loadChannels()], ['refresh-logs', () => loadLogs()]]) byId(id).addEventListener('click', () => withButton(byId(id), async () => { await loader(); toast('数据已刷新'); }));
   byId('channel-search').addEventListener('input', renderChannels);
   byId('channel-filter').addEventListener('change', renderChannels);
   document.addEventListener('click', (event) => {
@@ -1331,10 +1416,7 @@ function setup() {
   updateEndpoint();
   checkSession();
   setInterval(() => {
-    if (auth.authenticated && !document.hidden && !state.streamController && byId('channel-drawer').hidden && !byId('key-secret-dialog').open) {
-      loadAll();
-      if (location.hash === '#keys') loadKeys();
-    }
+    if (auth.authenticated && !document.hidden && !state.streamController && byId('channel-drawer').hidden && !byId('key-secret-dialog').open) refreshVisiblePage();
   }, 30000);
 }
 

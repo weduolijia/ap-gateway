@@ -168,8 +168,9 @@ app.delete('/api/keys/:id/permanent', async c => {
 });
 app.get('/api/status', async c => {
   const store = new Store(c.env.DB);
-  const [stats, settings] = await Promise.all([store.stats(), store.settings()]);
-  return c.json({ version: APP_VERSION, build: BUILD_DATE, authMode: authEnabled(c.env) ? 'enabled' : 'disabled', environment: c.env.APP_ENV ?? 'local', protocols: PROTOCOLS, fingerprints: FINGERPRINTS, headerPresets: HEADER_PRESETS, stats, settings });
+  const stats = c.req.query('stats') !== '0';
+  const [statsResult, settings] = await Promise.all([stats ? store.stats() : Promise.resolve(null), store.settings()]);
+  return c.json({ version: APP_VERSION, build: BUILD_DATE, authMode: authEnabled(c.env) ? 'enabled' : 'disabled', environment: c.env.APP_ENV ?? 'local', protocols: PROTOCOLS, fingerprints: FINGERPRINTS, headerPresets: HEADER_PRESETS, stats: statsResult, settings });
 });
 app.get('/api/channels', async c => c.json({ channels: (await new Store(c.env.DB).channels()).map(publicChannel) }));
 app.post('/api/channels', async c => {
@@ -210,7 +211,13 @@ app.post('/api/channels/:id/probe', async c => {
     throw new AppError((e as Error).name === 'AbortError' ? '模型发现超时' : '模型发现失败，请检查地址和网络', 502, 'probe_failed');
   }
 });
-app.get('/api/logs', async c => c.json({ logs: await new Store(c.env.DB).logs() }));
+app.get('/api/logs', async c => {
+  const store = new Store(c.env.DB);
+  const since = c.req.query('since');
+  if (since === undefined) return c.json(await store.logs());
+  if (!/^\d{1,15}$/.test(since)) throw new AppError('since 须为非负整数');
+  return c.json(await store.logsSince(Number(since)));
+});
 app.delete('/api/logs', async c => { await new Store(c.env.DB).clearLogs(); return c.json({ ok: true }); });
 app.get('/api/settings', async c => c.json({ settings: await new Store(c.env.DB).settings() }));
 app.put('/api/settings', async c => {

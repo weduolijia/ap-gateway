@@ -122,6 +122,14 @@ The runtime version lives in `src/version.ts` (`APP_VERSION`, `BUILD_DATE`, `VER
 
 Health and readiness responses set `cache-control: no-store`.
 
+## Dashboard Refresh
+
+The dashboard refreshes every 30 seconds, fetching only what the current page shows: the overview polls aggregated statistics and incremental logs, the channels page reads channels and configuration, the logs page pulls only new rows, and the settings page reads configuration alone. Hidden tabs, running tests and open dialogs skip the refresh.
+
+- `GET /api/logs` returns the newest 500 logs with a `cursor`.
+- `GET /api/logs?since=<cursor>` returns only rows newer than the cursor; a cleared table or a gap larger than one page returns `reset: true` with the full list.
+- `GET /api/status?stats=0` skips the request statistics aggregate and returns version, environment and settings only.
+
 ## Contributors
 
 - **weduolijia** — project owner and maintainer.

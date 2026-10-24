@@ -13,6 +13,10 @@ async function keyPoolHash(keys: string[]): Promise<string> {
   return Array.from(new Uint8Array(digest), value => value.toString(16).padStart(2, '0')).join('');
 }
 
+function parseLogRow(config: string): RequestLog {
+  return { keyIndex: null, keyCount: 0, ...JSON.parse(config) };
+}
+
 export class Store {
   constructor(private db: D1Database) {}
   async channels(): Promise<Channel[]> {
@@ -83,9 +87,25 @@ export class Store {
       this.db.prepare('DELETE FROM request_logs WHERE id IN (SELECT id FROM request_logs ORDER BY time DESC LIMIT -1 OFFSET ?)').bind(retention),
     ]);
   }
-  async logs(): Promise<RequestLog[]> {
-    const rows = await this.db.prepare('SELECT config FROM request_logs ORDER BY time DESC LIMIT 500').all<{ config: string }>();
-    return rows.results.map(r => ({ keyIndex: null, keyCount: 0, ...JSON.parse(r.config) }));
+  async logs(): Promise<{ logs: RequestLog[]; cursor: number }> {
+    const [rows, head] = await Promise.all([
+      this.db.prepare('SELECT config FROM request_logs ORDER BY time DESC LIMIT 500').all<{ config: string }>(),
+      this.db.prepare('SELECT COALESCE(MAX(rowid),0) AS cursor FROM request_logs').first<{ cursor: number }>(),
+    ]);
+    return { logs: rows.results.map(row => parseLogRow(row.config)), cursor: head?.cursor ?? 0 };
+  }
+  async logsSince(after: number): Promise<{ logs: RequestLog[]; cursor: number; reset: boolean }> {
+    const [rows, head] = await Promise.all([
+      this.db.prepare('SELECT config FROM request_logs WHERE rowid > ? ORDER BY rowid DESC LIMIT 500').bind(after).all<{ config: string }>(),
+      this.db.prepare('SELECT COALESCE(MAX(rowid),0) AS cursor FROM request_logs').first<{ cursor: number }>(),
+    ]);
+    const cursor = head?.cursor ?? 0;
+    // More new rows than one page means a full reload is cheaper than paging; a cursor past the
+    // current maximum can only mean the log table was cleared while the client was away.
+    if (rows.results.length >= 500 || (!rows.results.length && after > cursor)) {
+      return { logs: (await this.logs()).logs, cursor, reset: true };
+    }
+    return { logs: rows.results.map(row => parseLogRow(row.config)), cursor, reset: false };
   }
   async clearLogs(): Promise<void> { await this.db.prepare('DELETE FROM request_logs').run(); }
   async stats(): Promise<{ total: number; successRate: number; avgLatencyMs: number; activeChannels: number }> {
