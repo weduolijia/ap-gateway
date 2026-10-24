@@ -126,6 +126,22 @@ The runtime version lives in `src/version.ts` (`APP_VERSION`, `BUILD_DATE`, `VER
 
 Health and readiness responses set `cache-control: no-store`.
 
+## Runtime Panel
+
+The overview page shows a runtime panel backed by `GET /api/runtime` (administrator session required):
+
+- **D1 status**: connection state, per-table row counts, `config` payload size, request-log count and time range. The database file size comes from Cloudflare's metadata API when `CF_API_TOKEN` is set.
+- **Workers usage**: requests, 5xx count and durations recorded by the gateway itself for the current UTC day, plus free-plan reference limits. These are not account quota usage.
+- **Account-level metrics**: Workers requests/CPU and D1 rows read/written are account-scoped and require a token with Analytics read permission. Without one the panel says so instead of estimating.
+
+To enable account metrics, create an API token with Account Analytics read access and store it as a secret:
+
+```powershell
+npx wrangler secret put CF_API_TOKEN --env cloud
+```
+
+Set `CF_ACCOUNT_ID` and `CF_D1_DATABASE_ID` in the cloud environment to your own values.
+
 ## Dashboard Refresh
 
 The dashboard refreshes every 30 seconds, fetching only what the current page shows: the overview polls aggregated statistics and incremental logs, the channels page reads channels and configuration, the logs page pulls only new rows, and the settings page reads configuration alone. Hidden tabs, running tests and open dialogs skip the refresh.

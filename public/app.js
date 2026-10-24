@@ -60,7 +60,7 @@ function clearSensitiveData() {
     if (!['checkbox', 'radio'].includes(element.type)) element.value = '';
   });
   all('input, select, textarea', byId('test-form')).forEach((element) => { element.disabled = false; });
-  for (const id of ['channels-body', 'overview-channel-body', 'logs-body', 'gateway-keys-body', 'traffic-chart', 'detail-content', 'test-channel', 'test-model', 'setting-channel', 'response-text', 'response-raw', 'toast-container']) byId(id).replaceChildren();
+  for (const id of ['channels-body', 'overview-channel-body', 'logs-body', 'gateway-keys-body', 'traffic-chart', 'detail-content', 'test-channel', 'test-model', 'setting-channel', 'response-text', 'response-raw', 'runtime-d1', 'runtime-workers', 'runtime-tables', 'toast-container']) byId(id).replaceChildren();
   for (const id of ['metric-total', 'metric-success', 'metric-latency', 'metric-channels', 'channel-nav-count', 'overview-channel-count', 'channels-enabled-summary', 'channels-model-summary', 'channel-result-count', 'log-result-count', 'key-nav-count', 'gateway-key-count', 'gateway-key-summary', 'test-channel-note', 'test-upstream-note', 'settings-saved', 'password-status', 'test-ttfb', 'test-duration', 'test-http', 'key-status', 'key-input-summary', 'metric-total-foot', 'metric-channels-foot', 'chart-total']) byId(id).textContent = '—';
   for (const id of ['global-error', 'channel-form-error', 'create-key-error', 'keys-error', 'password-error', 'test-error']) setError(id, '');
   for (const id of ['event-count', 'test-events']) byId(id).textContent = '0';
@@ -300,6 +300,7 @@ function navigate() {
     else if (page === 'logs') loadLogs().catch(() => {});
     else if (page === 'overview') {
       loadLogs().catch(() => {});
+      loadRuntime().catch(() => {});
       if (state.statsStale || !state.status?.stats) loadStatus(true).catch(() => {});
     } else if (page === 'settings') loadStatus(false).catch(() => {});
   }
@@ -434,6 +435,68 @@ function renderTestUpstream(reset = false) {
   byId('test-upstream-note').textContent = fixedProtocol ? `渠道已固定上游协议：${protocolNames[fixedProtocol] || fixedProtocol}。客户端接口和返回格式保持客户端协议。` : channel ? '可临时指定本次请求的上游协议；跟随渠道配置时自动协商。' : '请先选择一个可用渠道。';
 }
 
+function formatBytes(bytes) {
+  if (bytes === null || bytes === undefined) return '—';
+  const units = ['B', 'KiB', 'MiB', 'GiB'];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return `${value >= 100 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+}
+
+function runtimeRow(label, value, tone = '') {
+  return `<dt>${escapeHtml(label)}</dt><dd${tone ? ` class="${tone}"` : ''}>${value}</dd>`;
+}
+
+async function loadRuntime() {
+  if (!auth.authenticated) return;
+  const version = auth.version;
+  const note = byId('runtime-note');
+  const health = byId('runtime-health');
+  try {
+    const view = await api('/api/runtime');
+    if (version !== auth.version || !auth.authenticated) return;
+    health.textContent = view.d1.reachable ? (view.d1.warnings.length ? '有提示' : '正常') : '不可用';
+    health.className = `inline-count${view.d1.reachable ? (view.d1.warnings.length ? ' warn' : '') : ' bad'}`;
+    const d1Tone = view.d1.reachable ? '' : 'bad';
+    byId('runtime-d1').innerHTML = [
+      runtimeRow('数据库', escapeHtml(view.d1.name), d1Tone),
+      runtimeRow('连接', view.d1.reachable ? '正常' : '连接失败', view.d1.reachable ? '' : 'bad'),
+      runtimeRow('数据表', view.d1.tables.length ? `${view.d1.tables.length} 张` : '—'),
+      runtimeRow('总行数', view.d1.totalRows === null ? '—' : numberFormat.format(view.d1.totalRows)),
+      runtimeRow('请求日志', view.d1.requestLogRows === null ? '—' : `${numberFormat.format(view.d1.requestLogRows)} 条`),
+      runtimeRow('日志时间范围', view.d1.logWindow.oldest ? `${escapeHtml(formatTime(view.d1.logWindow.oldest))} 至 ${escapeHtml(formatTime(view.d1.logWindow.newest))}` : '暂无记录'),
+      runtimeRow('数据库大小', view.d1.sizeBytes === null ? '未配置令牌' : formatBytes(view.d1.sizeBytes), view.d1.sizeBytes === null ? 'warn' : ''),
+      runtimeRow('存储上限占比', view.d1.storagePercent === null ? '—' : `${view.d1.storagePercent}%`),
+    ].join('');
+    const usage = view.workers.accountUsage;
+    const d1Usage = view.d1AccountUsage;
+    byId('runtime-workers').innerHTML = [
+      runtimeRow('今日请求（网关日志）', view.workers.requestsToday === null ? '—' : numberFormat.format(view.workers.requestsToday)),
+      runtimeRow('今日 5xx', view.workers.errorsToday === null ? '—' : numberFormat.format(view.workers.errorsToday), view.workers.errorsToday ? 'warn' : ''),
+      runtimeRow('日均耗时 / 最大', view.workers.averageDurationMs === null ? '—' : `${formatDuration(view.workers.averageDurationMs)} / ${formatDuration(view.workers.maxDurationMs)}`),
+      runtimeRow('账号今日请求', usage.available ? numberFormat.format(usage.requests) : '未配置令牌', usage.available ? '' : 'warn'),
+      runtimeRow('CPU P50 / P99', usage.available ? `${usage.cpuTimeP50Ms ?? '—'} / ${usage.cpuTimeP99Ms ?? '—'} ms` : '—'),
+      runtimeRow('单请求 CPU 上限', `${view.workers.planLimits.workerCpuMsPerRequest} ms`),
+      runtimeRow('每日请求上限', numberFormat.format(view.workers.planLimits.workerRequestsPerDay)),
+      runtimeRow('D1 今日读行', d1Usage.available ? numberFormat.format(d1Usage.rowsRead) : '未配置令牌', d1Usage.available ? '' : 'warn'),
+      runtimeRow('D1 今日写行', d1Usage.available ? numberFormat.format(d1Usage.rowsWritten) : '未配置令牌', d1Usage.available ? '' : 'warn'),
+      runtimeRow('D1 读行上限/日', numberFormat.format(view.workers.planLimits.d1RowsReadPerDay)),
+      runtimeRow('D1 写行上限/日', numberFormat.format(view.workers.planLimits.d1RowsWrittenPerDay)),
+    ].join('');
+    byId('runtime-tables').innerHTML = view.d1.tables.length
+      ? view.d1.tables.map(table => `<div class="runtime-table-row"><span>${escapeHtml(table.name)}</span><span>${table.rows === null ? '—' : numberFormat.format(table.rows)} 行${table.payloadBytes ? ` · ${formatBytes(table.payloadBytes)}` : ''}</span></div>`).join('')
+      : '<p class="field-note">无法读取数据表。</p>';
+    note.textContent = [...new Set([usage.note, d1Usage.note, ...view.d1.warnings].filter(Boolean))].join(' ');
+    note.hidden = !note.textContent;
+  } catch (error) {
+    if (version !== auth.version || !auth.authenticated) return;
+    health.textContent = '读取失败';
+    health.className = 'inline-count bad';
+    byId('runtime-note').textContent = `无法读取运行状态：${error.message}`;
+    byId('runtime-note').hidden = false;
+  }
+}
+
 function renderStats() {
   if (!state.status) return;
   const stats = state.status.stats;
@@ -515,7 +578,7 @@ async function refreshVisiblePage() {
   const version = auth.version;
   try {
     if (state.currentPage === 'overview') {
-      await Promise.all([loadStatus(true), loadChannels(), loadLogs()]);
+      await Promise.all([loadStatus(true), loadChannels(), loadLogs(), loadRuntime()]);
     } else if (state.currentPage === 'channels') {
       await Promise.all([loadStatus(false), loadChannels()]);
     } else if (state.currentPage === 'logs') {
@@ -1357,6 +1420,7 @@ function setup() {
   byId('sidebar-backdrop').addEventListener('click', closeSidebar);
   all('[data-open-channel]').forEach((button) => button.addEventListener('click', () => openChannel()));
   byId('refresh-all').addEventListener('click', () => withButton(byId('refresh-all'), () => loadAll(true)));
+  byId('refresh-runtime').addEventListener('click', () => withButton(byId('refresh-runtime'), async () => { await loadRuntime(); toast('运行状态已刷新'); }));
   for (const [id, loader] of [['refresh-channels', () => loadChannels()], ['refresh-logs', () => loadLogs()]]) byId(id).addEventListener('click', () => withButton(byId(id), async () => { await loader(); toast('数据已刷新'); }));
   byId('channel-search').addEventListener('input', renderChannels);
   byId('channel-filter').addEventListener('change', renderChannels);

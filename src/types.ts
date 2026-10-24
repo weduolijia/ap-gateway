@@ -70,4 +70,7 @@ export interface Bindings {
   ALLOW_LOCAL_UPSTREAM?: string;
   ALLOW_UNAUTHENTICATED_PUBLIC?: string;
   AUTH_ENABLED?: string;
+  CF_ACCOUNT_ID?: string;
+  CF_D1_DATABASE_ID?: string;
+  CF_API_TOKEN?: string;
 }

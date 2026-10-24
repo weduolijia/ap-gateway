@@ -7,6 +7,7 @@ import { discoverModels, gateway, limitedJson } from './gateway';
 import { AuthService } from './auth';
 import { authEnabled, clientApiKey, requireCsrf, sessionCookie, sessionCsrf, sessionToken, upstreamRequest } from './access';
 import { APP_VERSION, BUILD_DATE, VERSION_TAG } from './version';
+import { runtimeView } from './runtime';
 
 const app = new Hono<{ Bindings: Bindings; Variables: { keyPolicy?: KeyPolicy } }>();
 const localHost = (h: string) => ['localhost', '127.0.0.1', '[::1]', '::1'].includes(h);
@@ -172,6 +173,7 @@ app.get('/api/status', async c => {
   const [statsResult, settings] = await Promise.all([stats ? store.stats() : Promise.resolve(null), store.settings()]);
   return c.json({ version: APP_VERSION, build: BUILD_DATE, authMode: authEnabled(c.env) ? 'enabled' : 'disabled', environment: c.env.APP_ENV ?? 'local', protocols: PROTOCOLS, fingerprints: FINGERPRINTS, headerPresets: HEADER_PRESETS, stats: statsResult, settings });
 });
+app.get('/api/runtime', async c => c.json(await runtimeView(c.env.DB, c.env)));
 app.get('/api/channels', async c => c.json({ channels: (await new Store(c.env.DB).channels()).map(publicChannel) }));
 app.post('/api/channels', async c => {
   const store = new Store(c.env.DB);

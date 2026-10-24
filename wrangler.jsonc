@@ -41,7 +41,11 @@
         "APP_ENV": "cloud-test",
         "ALLOW_LOCAL_UPSTREAM": "false",
         "ALLOW_UNAUTHENTICATED_PUBLIC": "false",
-        "AUTH_ENABLED": "true"
+        "AUTH_ENABLED": "true",
+        // Optional, for the runtime panel: your account ID and D1 database ID.
+        // Leave empty to skip the Cloudflare metadata lookup.
+        "CF_ACCOUNT_ID": "",
+        "CF_D1_DATABASE_ID": ""
       }
     }
   }

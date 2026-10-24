@@ -764,3 +764,19 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--focus);outline-offs
 #key-policy-models .field-note{margin:0;grid-column:1 / -1}
 #key-policy-all-row{margin-top:var(--sp-3)}
 @media(max-width:600px){#key-policy-models{grid-template-columns:1fr}}
+
+/* ⑬ 概览运行状态面板 ------------------------------------------------ */
+.runtime-panel{margin-bottom:23px}
+.runtime-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--sp-6);padding:0 23px 18px}
+.runtime-block h3{font-size:var(--fs-sm);font-weight:600;color:var(--text-2);margin-bottom:var(--sp-3)}
+.runtime-list{display:grid;grid-template-columns:auto minmax(0,1fr);gap:var(--sp-2) var(--sp-4);margin:0;font-size:var(--fs-2xs)}
+.runtime-list dt{color:var(--text-3)}
+.runtime-list dd{margin:0;color:var(--text-2);text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.runtime-list dd.warn{color:var(--amber)}
+.runtime-list dd.bad{color:var(--red)}
+.runtime-tables{display:flex;flex-direction:column;gap:var(--sp-1);font-size:var(--fs-2xs);max-height:180px;overflow-y:auto}
+.runtime-table-row{display:flex;justify-content:space-between;gap:var(--sp-3);color:var(--text-2)}
+.runtime-table-row span:first-child{font-family:"Cascadia Code","SFMono-Regular",Consolas,"Liberation Mono",monospace;overflow-wrap:anywhere}
+.runtime-table-row span:last-child{color:var(--text-3);white-space:nowrap;font-variant-numeric:tabular-nums}
+.runtime-note{padding:0 23px 21px}
+@media(max-width:1000px){.runtime-grid{grid-template-columns:1fr;gap:var(--sp-5)}}
