@@ -111,6 +111,10 @@ Use the migration scripts when upgrading an existing database. Back up D1 before
 
 Personal deployment bindings, operator records, saved page snapshots and private development history are not part of this publication. Do not commit passwords, API keys, credentials files, database snapshots or runtime state.
 
+## Channel Model Discovery
+
+`POST /api/channels/probe` accepts the same fields as channel creation and returns the upstream model list for those values, so a channel can be probed before it is saved. Pass `channelId` to reuse the rest of a saved channel's configuration. Probing uses the first key directly and never advances the key-rotation cursor. The dashboard's probe button replaces the model list with the upstream result instead of merging it, so delisted models do not linger. `POST /api/channels/{id}/probe` keeps the original saved-channel behaviour.
+
 ## Version And Readiness
 
 The runtime version lives in `src/version.ts` (`APP_VERSION`, `BUILD_DATE`, `VERSION_TAG`). `package.json`, `package-lock.json` and the runtime constant are kept in sync by `test/version.test.ts`; bump them together for every release.

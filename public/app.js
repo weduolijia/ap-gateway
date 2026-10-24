@@ -847,7 +847,6 @@ function openChannel(id = null) {
   byId('key-status').textContent = keyCount ? `已保存 ${keyCount} 个 Key` : '可选';
   byId('channel-keys').placeholder = keyCount ? `已保存 ${keyCount} 个 Key，留空保留\n每行输入一个新 Key，将替换整个密钥池` : '每行输入一个 API Key';
   renderKeyInputSummary();
-  byId('drawer-probe').hidden = !channel;
   all('[name="protocols"]').forEach((checkbox) => { checkbox.checked = (channel?.protocols || Object.keys(protocolNames)).includes(checkbox.value); });
   byId('protocol-options').hidden = byId('channel-protocol').value !== 'auto';
   setError('channel-form-error', '');
@@ -865,12 +864,16 @@ function closeDrawer() {
   state.drawerReturnFocus?.focus();
 }
 
-function jsonObject(id, label) {
-  let value;
-  try { value = JSON.parse(byId(id).value || '{}'); }
+function jsonObjectValue(value, label) {
+  let parsed;
+  try { parsed = JSON.parse(value || '{}'); }
   catch { throw new Error(`${label}不是有效 JSON，请检查引号、逗号与括号。`); }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label}须为 JSON 对象，例如 {"名称": "值"}。`);
-  return value;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`${label}须为 JSON 对象，例如 {"名称": "值"}。`);
+  return parsed;
+}
+
+function jsonObject(id, label) {
+  return jsonObjectValue(byId(id).value, label);
 }
 
 function readModels(value) {
@@ -887,6 +890,25 @@ function renderKeyInputSummary() {
   byId('key-input-summary').textContent = byId('channel-clear-key').checked ? `保存后将清空已保存的 ${saved} 个 Key。` : count ? `将${saved ? '替换为' : '保存'} ${count} 个 Key${count > 1 ? '，按输入顺序轮换' : ''}；空行与重复项会自动忽略。` : saved ? `留空保留已保存的 ${saved} 个 Key；填写新 Key 将替换整个密钥池。` : '可添加一个或多个 Key；留空使用无密钥连接。';
 }
 
+function channelFormPayload() {
+  const protocol = byId('channel-protocol').value;
+  const protocols = all('[name="protocols"]:checked').map((checkbox) => checkbox.value);
+  if (protocol === 'auto' && !protocols.length) throw new Error('自动模式至少需要选择一种上游协议。');
+  const payload = {
+    name: byId('channel-name').value.trim(), baseUrl: byId('channel-url').value.trim(),
+    enabled: byId('channel-enabled').checked, priority: Number(byId('channel-priority').value),
+    timeoutMs: Number(byId('channel-timeout').value), protocol,
+    protocols: protocol === 'auto' ? protocols : [...new Set([...protocols, protocol])],
+    fingerprint: byId('channel-fingerprint').value,
+    headers: jsonObject('channel-headers', '自定义请求头'),
+    models: readModels(byId('channel-models').value), modelMap: jsonObject('channel-model-map', '模型别名映射'),
+  };
+  const apiKeys = readKeys(byId('channel-keys').value);
+  if (byId('channel-clear-key').checked) payload.apiKeys = null;
+  else if (apiKeys.length) payload.apiKeys = apiKeys;
+  return payload;
+}
+
 async function saveChannel(event) {
   event.preventDefault();
   const button = byId('save-channel');
@@ -894,21 +916,7 @@ async function saveChannel(event) {
   await withButton(button, async () => {
     try {
       setError('channel-form-error', '');
-      const protocol = byId('channel-protocol').value;
-      const protocols = all('[name="protocols"]:checked').map((checkbox) => checkbox.value);
-      if (protocol === 'auto' && !protocols.length) throw new Error('自动模式至少需要选择一种上游协议。');
-      const payload = {
-        name: byId('channel-name').value.trim(), baseUrl: byId('channel-url').value.trim(),
-        enabled: byId('channel-enabled').checked, priority: Number(byId('channel-priority').value),
-        timeoutMs: Number(byId('channel-timeout').value), protocol,
-        protocols: protocol === 'auto' ? protocols : [...new Set([...protocols, protocol])],
-        fingerprint: byId('channel-fingerprint').value,
-        headers: jsonObject('channel-headers', '自定义请求头'),
-        models: readModels(byId('channel-models').value), modelMap: jsonObject('channel-model-map', '模型别名映射'),
-      };
-      const apiKeys = readKeys(byId('channel-keys').value);
-      if (byId('channel-clear-key').checked) payload.apiKeys = null;
-      else if (apiKeys.length) payload.apiKeys = apiKeys;
+      const payload = channelFormPayload();
       await api(state.editingId ? `/api/channels/${encodeURIComponent(state.editingId)}` : '/api/channels', { method: state.editingId ? 'PUT' : 'POST', body: JSON.stringify(payload) });
       toast(state.editingId ? '渠道已保存' : '渠道已添加，可以开始测试了');
       saved = true;
@@ -981,20 +989,28 @@ async function channelAction(action, id, button) {
 }
 
 async function probeModels(button, drawer = false) {
-  const channelId = drawer ? state.editingId : byId('test-channel').value;
-  if (!channelId) return toast('请先保存渠道，再探测模型列表。', true);
   await withButton(button, async () => {
     try {
+      if (drawer) {
+        const payload = channelFormPayload();
+        if (state.editingId) payload.channelId = state.editingId;
+        const result = await api('/api/channels/probe', { method: 'POST', body: JSON.stringify(payload) });
+        if (byId('channel-drawer').hidden) return;
+        byId('channel-models').value = result.models.join('\n');
+        if (state.editingId) state.discovered.set(state.editingId, result.models);
+        toast(`发现 ${result.models.length} 个模型，已整体替换模型列表。点击保存渠道后生效。`);
+        return;
+      }
+      const channelId = byId('test-channel').value;
+      if (!channelId) return toast('请先选择一个渠道，再探测模型列表。', true);
       const result = await api(`/api/channels/${encodeURIComponent(channelId)}/probe`, { method: 'POST' });
       state.discovered.set(channelId, result.models);
-      if (drawer && state.editingId === channelId) {
-        byId('channel-models').value = [...new Set([...readModels(byId('channel-models').value), ...result.models])].join('\n');
-        toast(`发现 ${result.models.length} 个模型，已填入列表。点击保存渠道后生效。`);
-      } else {
-        renderTestModels();
-        toast(result.message);
-      }
-    } catch (error) { toast(error.message, true); }
+      renderTestModels();
+      toast(result.message);
+    } catch (error) {
+      toast(error.message, true);
+      if (drawer) setError('channel-form-error', error.message);
+    }
   });
 }
 

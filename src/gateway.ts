@@ -1,4 +1,4 @@
-import type { Bindings, Channel, Fingerprint, KeyPolicy, Protocol, RequestLog, UpstreamDiagnostics } from './types';
+import type { Bindings, Channel, ChannelKeySelection, Fingerprint, KeyPolicy, Protocol, RequestLog, UpstreamDiagnostics } from './types';
 import { AppError, channelApiKeys, FINGERPRINTS, PROTOCOLS, record } from './config';
 import { upstreamHeaders, responseHeaders, parseRetryAfter, sanitizeUpstreamText } from './headers';
 import { convertRequest, convertResponse, convertStream } from './protocols';
@@ -221,12 +221,12 @@ export async function gateway(request: Request, env: Bindings, ctx: { waitUntil(
   }
 }
 
-export async function discoverModels(channel: Channel, store: Store): Promise<{ models: string[]; protocols: Protocol[]; message: string; keyIndex: number | null; keyCount: number }> {
+export async function discoverModels(channel: Channel, store: Store, selection?: ChannelKeySelection): Promise<{ models: string[]; protocols: Protocol[]; message: string; keyIndex: number | null; keyCount: number }> {
   if (channel.isDemo) return { models: channel.models, protocols: channel.protocols, message: '内置演示器可用，无外部请求', keyIndex: null, keyCount: 0 };
-  const selection = await store.selectApiKey(channel);
+  const selected = selection ?? await store.selectApiKey(channel);
   const secrets = diagnosticSecrets([channel]);
-  if (selection.apiKey) secrets.push(selection.apiKey);
-  const context = { id: crypto.randomUUID(), channelId: channel.id, incomingProtocol: channel.protocol === 'auto' ? channel.protocols[0] : channel.protocol, upstreamProtocol: channel.protocols[0], fingerprint: channel.fingerprint, attempts: 0, keyIndex: selection.keyIndex };
+  if (selected.apiKey) secrets.push(selected.apiKey);
+  const context = { id: crypto.randomUUID(), channelId: channel.id, incomingProtocol: channel.protocol === 'auto' ? channel.protocols[0] : channel.protocol, upstreamProtocol: channel.protocols[0], fingerprint: channel.fingerprint, attempts: 0, keyIndex: selected.keyIndex };
   const choices = channel.protocol === 'auto' ? channel.protocols : [channel.protocol];
   const tried = new Set<string>();
   for (const protocol of choices) {
@@ -236,7 +236,7 @@ export async function discoverModels(channel: Channel, store: Store): Promise<{ 
     try {
       context.upstreamProtocol = protocol;
       context.attempts++;
-      const res = await fetch(url, { headers: upstreamHeaders(new Headers(), channel, protocol, channel.fingerprint, false, selection.apiKey), redirect: 'manual', signal: abort.signal });
+      const res = await fetch(url, { headers: upstreamHeaders(new Headers(), channel, protocol, channel.fingerprint, false, selected.apiKey), redirect: 'manual', signal: abort.signal });
       if (!res.ok) {
         if ([404, 405].includes(res.status)) { await res.body?.cancel(); continue; }
         const body = res.status === 429 ? await limitedJson(res, 65536).catch(() => ({})) : undefined;
@@ -247,7 +247,7 @@ export async function discoverModels(channel: Channel, store: Store): Promise<{ 
       const values = json.data ?? json.models;
       if (!Array.isArray(values)) throw new AppError('上游没有返回可识别的模型列表', 502, 'probe_invalid');
       const models = [...new Set<string>(values.map((m: any) => String(m.id ?? m.name ?? '').replace(/^models\//, '')).filter(Boolean))];
-      return { models, protocols: channel.protocols, message: `发现 ${models.length} 个模型。此操作仅查询模型列表；推理协议将在真实请求时协商。`, keyIndex: selection.keyIndex, keyCount: selection.keyCount };
+      return { models, protocols: channel.protocols, message: `发现 ${models.length} 个模型。此操作仅查询模型列表；推理协议将在真实请求时协商。`, keyIndex: selected.keyIndex, keyCount: selected.keyCount };
     } catch (error) {
       if (error instanceof AppError) gatewayHeaders(error.headers, context);
       throw error;

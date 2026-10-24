@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { Bindings, KeyPolicy, Protocol } from './types';
-import { AppError, FINGERPRINTS, PROTOCOLS, publicChannel, record, validateChannel, validateSettings } from './config';
+import { AppError, channelApiKeys, FINGERPRINTS, PROTOCOLS, publicChannel, record, validateChannel, validateSettings } from './config';
 import { HEADER_PRESETS } from './headers';
 import { Store } from './store';
 import { discoverModels, gateway, limitedJson } from './gateway';
@@ -201,6 +201,25 @@ app.delete('/api/channels/:id', async c => {
   const settings = await store.settings();
   if (settings.defaultChannelId === id) { settings.defaultChannelId = 'demo'; await store.saveSettings(settings); }
   return c.json({ ok: true });
+});
+app.post('/api/channels/probe', async c => {
+  const input = await bodyJson(c.req.raw);
+  if (!record(input)) throw new AppError('探测请求须为 JSON 对象');
+  const store = new Store(c.env.DB);
+  const existingId = typeof input.channelId === 'string' && input.channelId ? input.channelId : null;
+  const existing = existingId ? await store.channel(existingId) : null;
+  if (existingId && !existing) throw new AppError('渠道不存在', 404);
+  // A draft has no row in D1, so the rotation table cannot be used; probe with the first key.
+  const channel = validateChannel(input, c.env, existing ?? undefined);
+  const keys = channelApiKeys(channel);
+  const selection = { apiKey: keys[0], keyIndex: keys.length ? 1 : null, keyCount: keys.length };
+  try {
+    const result = await discoverModels(channel, store, selection);
+    return c.json({ ...result, saved: !!existingId });
+  } catch (e) {
+    if (e instanceof AppError) throw e;
+    throw new AppError((e as Error).name === 'AbortError' ? '模型发现超时' : '模型发现失败，请检查地址和网络', 502, 'probe_failed');
+  }
 });
 app.post('/api/channels/:id/probe', async c => {
   const store = new Store(c.env.DB);
