@@ -1,5 +1,7 @@
 # AP Gateway
 
+> **AI-generated, for entertainment only.** This project and its documentation were produced by AI assistants and are published for fun and learning, not as production-ready software. 本项目由 AI 生成，仅供娱乐，请勿用于生产环境。
+
 A Cloudflare Workers + D1 model gateway with a Chinese administration dashboard, channel management, model aliases, streaming tests and request logs.
 
 Supports OpenAI Chat Completions, OpenAI Responses, Anthropic Messages and Gemini. A channel can use automatic protocol negotiation or a fixed upstream protocol. Native requests pass through without conversion; cross-protocol requests convert supported text, images and custom function tools, and reject unsupported semantics explicitly.
@@ -104,6 +106,11 @@ Then run `npm run test:auth` in another terminal. Cloud tests require `AP_CLOUD_
 Use the migration scripts when upgrading an existing database. Back up D1 before schema changes. This is a single-administrator gateway, not a billing or multi-user service.
 
 Personal deployment bindings, operator records, saved page snapshots and private development history are not part of this publication. Do not commit passwords, API keys, credentials files, database snapshots or runtime state.
+
+## Contributors
+
+- **weduolijia** — project owner and maintainer.
+- **AI assistants** — Codex (OpenAI) and Claude (Anthropic) contributed to this project, including the code work, the credential and history audit, and the preparation of this public release.
 
 ## Third-Party Attribution
 
