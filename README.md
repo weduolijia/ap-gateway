@@ -107,6 +107,17 @@ Use the migration scripts when upgrading an existing database. Back up D1 before
 
 Personal deployment bindings, operator records, saved page snapshots and private development history are not part of this publication. Do not commit passwords, API keys, credentials files, database snapshots or runtime state.
 
+## Version And Readiness
+
+The runtime version lives in `src/version.ts` (`APP_VERSION`, `BUILD_DATE`, `VERSION_TAG`). `package.json`, `package-lock.json` and the runtime constant are kept in sync by `test/version.test.ts`; bump them together for every release.
+
+- `GET /healthz` returns `version`, `build`, `authMode` and `environment` without authentication.
+- `GET /readyz` runs `SELECT 1` against D1 and returns 200 with `database: "ok"`, or 503 with `database: "unavailable"`.
+- Every response, including errors, redirects and cross-site rejections, carries `x-ap-version: <version> (<build-date>)`.
+- The dashboard sidebar shows `v<version> · <build-date>`; hover it for the runtime environment.
+
+Health and readiness responses set `cache-control: no-store`.
+
 ## Contributors
 
 - **weduolijia** — project owner and maintainer.

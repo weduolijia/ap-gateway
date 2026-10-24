@@ -1,6 +1,6 @@
 {
   "name": "ap-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Cloudflare Workers model gateway with protocol negotiation and a local-first dashboard",
@@ -21,6 +21,15 @@
     "test:cloud": "node verification/cloud-smoke.mjs",
     "verify": "npm run typecheck && npm test && npm run build"
   },
-  "dependencies": { "hono": "^4.0.0", "eventsource-parser": "^3.0.0" },
-  "devDependencies": { "@cloudflare/workers-types": "^5.20261019.1", "typescript": "^5.7.0", "vitest": "^3.0.0", "wrangler": "^4.0.0", "@types/node": "^22.0.0" }
+  "dependencies": {
+    "hono": "^4.0.0",
+    "eventsource-parser": "^3.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261019.1",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0",
+    "wrangler": "^4.0.0",
+    "@types/node": "^22.0.0"
+  }
 }

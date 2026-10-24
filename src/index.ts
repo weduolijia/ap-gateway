@@ -6,20 +6,22 @@ import { Store } from './store';
 import { discoverModels, gateway, limitedJson } from './gateway';
 import { AuthService } from './auth';
 import { authEnabled, clientApiKey, requireCsrf, sessionCookie, sessionCsrf, sessionToken, upstreamRequest } from './access';
+import { APP_VERSION, BUILD_DATE, VERSION_TAG } from './version';
 
 const app = new Hono<{ Bindings: Bindings; Variables: { keyPolicy?: KeyPolicy } }>();
 const localHost = (h: string) => ['localhost', '127.0.0.1', '[::1]', '::1'].includes(h);
+const versioned = (response: Response) => { response.headers.set('x-ap-version', VERSION_TAG); return response; };
 app.use('*', async (c, next) => {
   const url = new URL(c.req.url);
   const path = c.req.path;
   if (authEnabled(c.env) && !localHost(url.hostname) && url.protocol !== 'https:') {
     if (['GET', 'HEAD'].includes(c.req.method)) {
       url.protocol = 'https:';
-      return new Response(null, { status: 308, headers: { location: url.toString(), 'cache-control': 'no-store' } });
+      return versioned(new Response(null, { status: 308, headers: { location: url.toString(), 'cache-control': 'no-store' } }));
     }
     throw new AppError('请通过 HTTPS 访问网关', 400, 'https_required');
   }
-  if (!localHost(url.hostname) && !authEnabled(c.env) && c.env.ALLOW_UNAUTHENTICATED_PUBLIC !== 'true') return c.json({ error: { message: '测试版仅允许本地访问；尚未启用线上访问', type: 'local_only' } }, 403);
+  if (!localHost(url.hostname) && !authEnabled(c.env) && c.env.ALLOW_UNAUTHENTICATED_PUBLIC !== 'true') return versioned(c.json({ error: { message: '测试版仅允许本地访问；尚未启用线上访问', type: 'local_only' } }, 403));
   const origin = c.req.header('origin');
   const documentNavigation = ['GET', 'HEAD'].includes(c.req.method)
     && ['/', '/index.html'].includes(path)
@@ -27,10 +29,10 @@ app.use('*', async (c, next) => {
     && c.req.header('sec-fetch-dest') === 'document';
   const accessVary = 'Origin, Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest';
   if (!documentNavigation && ((origin && origin !== url.origin) || c.req.header('sec-fetch-site') === 'cross-site')) {
-    return c.json({ error: { message: '不允许跨站访问网关', type: 'origin_not_allowed' } }, 403, { 'cache-control': 'no-store', vary: accessVary });
+    return versioned(c.json({ error: { message: '不允许跨站访问网关', type: 'origin_not_allowed' } }, 403, { 'cache-control': 'no-store', vary: accessVary }));
   }
   if (c.req.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: { 'access-control-allow-origin': url.origin, 'access-control-allow-methods': 'GET,POST,PUT,DELETE,OPTIONS', 'access-control-allow-headers': 'content-type,authorization,x-api-key,anthropic-version,anthropic-beta,x-goog-api-key,x-ap-channel,x-ap-protocol,x-ap-fingerprint,x-csrf-token', vary: accessVary } });
+    return versioned(new Response(null, { status: 204, headers: { 'access-control-allow-origin': url.origin, 'access-control-allow-methods': 'GET,POST,PUT,DELETE,OPTIONS', 'access-control-allow-headers': 'content-type,authorization,x-api-key,anthropic-version,anthropic-beta,x-goog-api-key,x-ap-channel,x-ap-protocol,x-ap-fingerprint,x-csrf-token', vary: accessVary } }));
   }
   const modelEndpoint = path.startsWith('/v1/') || path.startsWith('/v1beta/');
   const publicAuthEndpoint = ['/api/auth/session', '/api/auth/login'].includes(path);
@@ -48,11 +50,12 @@ app.use('*', async (c, next) => {
     }
   }
   await next();
+  c.header('x-ap-version', VERSION_TAG);
   c.header('vary', [...new Set([...(c.res.headers.get('vary') ?? '').split(',').map(value => value.trim()).filter(Boolean), ...accessVary.split(', '), 'Cookie'])].join(', '));
   c.header('x-content-type-options', 'nosniff');
   c.header('referrer-policy', 'no-referrer');
   if (authEnabled(c.env) && !localHost(url.hostname) && url.protocol === 'https:') c.header('strict-transport-security', 'max-age=31536000');
-  if (path.startsWith('/api/') || path.startsWith('/v1')) c.header('cache-control', 'no-store, no-transform');
+  if (path.startsWith('/api/') || path.startsWith('/v1') || ['/healthz', '/readyz'].includes(path)) c.header('cache-control', 'no-store, no-transform');
   else c.header('content-security-policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
 });
 app.onError((err, c) => {
@@ -62,6 +65,7 @@ app.onError((err, c) => {
   const headers = new Headers(err instanceof AppError ? err.headers : undefined);
   headers.set('content-type', 'application/json; charset=utf-8');
   headers.set('cache-control', 'no-store');
+  headers.set('x-ap-version', VERSION_TAG);
   const diagnostics = err instanceof AppError ? err.diagnostics : {};
   return new Response(JSON.stringify({ type: 'error', error: { type: e.code ?? (status === 500 ? 'internal_error' : 'invalid_request_error'), message, ...diagnostics } }), { status, headers });
 });
@@ -74,7 +78,15 @@ async function bodyJson(req: Request): Promise<any> {
     throw new AppError('请求体不是有效 JSON');
   }
 }
-app.get('/healthz', c => c.json({ ok: true, version: '0.1.0', authMode: authEnabled(c.env) ? 'enabled' : 'disabled', environment: c.env.APP_ENV ?? 'local' }));
+app.get('/healthz', c => c.json({ ok: true, version: APP_VERSION, build: BUILD_DATE, authMode: authEnabled(c.env) ? 'enabled' : 'disabled', environment: c.env.APP_ENV ?? 'local' }));
+app.get('/readyz', async c => {
+  try {
+    await c.env.DB.prepare('SELECT 1 AS ok').first();
+    return c.json({ ok: true, version: APP_VERSION, build: BUILD_DATE, database: 'ok' });
+  } catch {
+    return c.json({ ok: false, version: APP_VERSION, build: BUILD_DATE, database: 'unavailable' }, 503);
+  }
+});
 app.get('/api/auth/session', async c => {
   if (!authEnabled(c.env)) return c.json({ authMode: 'disabled', authenticated: true });
   const token = sessionToken(c.req.raw);
@@ -157,7 +169,7 @@ app.delete('/api/keys/:id/permanent', async c => {
 app.get('/api/status', async c => {
   const store = new Store(c.env.DB);
   const [stats, settings] = await Promise.all([store.stats(), store.settings()]);
-  return c.json({ version: '0.1.0', authMode: authEnabled(c.env) ? 'enabled' : 'disabled', environment: c.env.APP_ENV ?? 'local', protocols: PROTOCOLS, fingerprints: FINGERPRINTS, headerPresets: HEADER_PRESETS, stats, settings });
+  return c.json({ version: APP_VERSION, build: BUILD_DATE, authMode: authEnabled(c.env) ? 'enabled' : 'disabled', environment: c.env.APP_ENV ?? 'local', protocols: PROTOCOLS, fingerprints: FINGERPRINTS, headerPresets: HEADER_PRESETS, stats, settings });
 });
 app.get('/api/channels', async c => c.json({ channels: (await new Store(c.env.DB).channels()).map(publicChannel) }));
 app.post('/api/channels', async c => {

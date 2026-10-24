@@ -431,7 +431,8 @@ function renderStats() {
   byId('metric-latency').innerHTML = stats.total ? `${numberFormat.format(stats.avgLatencyMs)}<small>ms</small>` : '—';
   byId('metric-channels').textContent = stats.activeChannels;
   byId('metric-channels-foot').textContent = `${state.channels.filter((channel) => !channel.isDemo).length} 个真实渠道 · 另有 1 个内置演示`;
-  byId('version-label').textContent = `v${state.status.version}`;
+  byId('version-label').textContent = state.status.build ? `v${state.status.version} · ${state.status.build}` : `v${state.status.version}`;
+  byId('version-label').title = `运行环境：${state.status.environment}${state.status.build ? `\n构建日期：${state.status.build}` : ''}`;
   const currentHour = Math.floor(Date.now() / 3600000);
   const counts = Array.from({ length: 24 }, () => 0);
   for (const log of state.logs) {
